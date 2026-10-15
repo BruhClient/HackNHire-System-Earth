@@ -1,0 +1,15 @@
+# Never bake your Neon password into the image - it is read from the mounted folder instead
+.env
+.env.txt
+
+# Outputs, caches and local environments
+database/results/
+compare/results/
+**/__pycache__/
+.venv/
+
+# Your own maps and farms are shared at run time with -v, not copied into the image
+data/tiff/*
+!data/tiff/test_map.tif
+data/geojson/*
+!data/geojson/test_plots.geojson

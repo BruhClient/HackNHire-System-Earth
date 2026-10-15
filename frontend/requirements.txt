@@ -1,0 +1,4 @@
+PyQt5>=5.15
+PyQtWebEngine>=5.15
+# The app imports backend/database/*.py to read the map from Neon, so it needs the backend's packages
+-r ../backend/requirements.txt

@@ -1,0 +1,19 @@
+# Your Neon password lives in .env - never commit it
+.env
+.env.txt
+
+# Personal notes for Claude Code (CLAUDE.md itself is shared)
+CLAUDE.local.md
+
+# Outputs and caches
+database/results/
+compare/results/
+__pycache__/
+.venv/
+
+# Maps can be huge, and farm files are customer data - keep them out of Git
+# (the small made-up test files are kept)
+data/tiff/*
+!data/tiff/test_map.tif
+data/geojson/*
+!data/geojson/test_plots.geojson
