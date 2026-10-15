@@ -1,33 +1,40 @@
 """
-compare.py - the evaluation: both approaches vs the original TIFF, on the same farms.
+compare.py - the evaluation: what Neon answers vs the original data, on the same plots.
 
-The two questions are tested separately:
+Part 1, the 5 colours: stencils and outlines vs the TIFF they were built from.
   Question 1  "Is the point in forest?"          - every point farm
   Question 2  "Does the outline overlap forest?" - every outline farm
-For each one, every method reports
-  * decision fidelity - % of farms whose answers match the TIFF exactly (in forest? / overlaps
-                        forest?, every colour touched, the EUDR verdict)
-  * query speed       - all farms in one go, per farm, and one farm checked on its own
-Then, for the whole map:
-  * pixel fidelity    - rebuild the whole map from the database and compare pixel by pixel
-  * storage           - database size vs the TIFF
+  For each one, every method reports
+    * decision fidelity - % of farms whose answers match the TIFF exactly (in forest? / overlaps
+                          forest?, every colour touched, the EUDR verdict)
+    * query speed       - all farms in one go, per farm, and one farm checked on its own
+  Each approach is compared with the TIFF using the SAME rule, so only the storage differs:
+    stencils  <->  TIFF counted in pixels   (--rule touched|centre)
+    polygons  <->  TIFF measured by exact overlap area
+  (For a point both rules are the same: the colour of the pixel it lands on.)
+  Then pixel fidelity: the whole map rebuilt from the database, compared pixel by pixel.
 
-Each approach is compared with the TIFF using the SAME rule, so only the storage differs:
-  stencils  <->  TIFF counted in pixels   (--rule touched|centre)
-  polygons  <->  TIFF measured by exact overlap area
-(For a point both rules are the same: the colour of the pixel it lands on.)
+Part 2, the evidence (only for a map uploaded from a results folder of the compaction step):
+    * decision fidelity - every output eudr_layers.py gives a plot (verdict, reason, every hectare
+                          figure, the years), from Neon vs from evidence.tif; and, from the
+                          compaction step's own check (--verify), evidence.tif vs the original layers
+    * query speed       - Neon vs evidence.tif on disk (and the original layers, from that check)
+    * pixel fidelity    - the evidence rebuilt from Neon vs evidence.tif, all 32 bits; and what
+                          evidence.tif keeps of each original layer
+    * storage           - from the original layers, through evidence.tif, to each approach in Neon
 
-Run both 'build' commands on the same TIFF first, then (from the project folder):
-    python compare/compare.py test_map.tif test_plots.geojson         # farms from a GeoJSON
-    python compare/compare.py test_map.tif --point 103.6236 -1.7794  # one point: longitude latitude
-    python compare/compare.py test_map.tif my_farms.geojson --point 103.5 -1.6 --point 103.6 -1.7
-With several maps stored, add --map NAME (the map the TIFF was uploaded as).
-Give just the file names (looked up in data/tiff/ and data/geojson/) or full paths.
-For a GeoJSON, the per-farm table is written to compare/results/comparison.csv.
+Run from the backend folder, after the map is uploaded:
+    python compare/compare.py layers/jambi --map jambi                    # a results folder: its test plots
+    python compare/compare.py layers/jambi farms.geojson --map jambi      # other plots
+    python compare/compare.py my_map.tif farms.geojson --map riau         # a map uploaded from a 5-colour TIFF
+    python compare/compare.py layers/jambi --point 103.6236 -1.7794       # one point: longitude latitude
+A results folder is given by its path or its name in layers/. With several maps stored, add --map NAME.
+The per-farm tables go to compare/results/comparison.csv (and comparison_evidence.csv).
 """
 
 import argparse
 import csv
+import json
 import os
 import statistics
 import sys
@@ -36,13 +43,16 @@ import numpy as np
 import rasterio
 from pyproj import Transformer
 
-# The two approaches live in the database/ folder next to this one - make them importable.
+# The approaches live in the database/ folder next to this one - make them importable.
 COMPARE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(COMPARE_DIR), "database"))
 
 import common  # noqa: E402
+import evidence_approach  # noqa: E402
+import layers  # noqa: E402
 import polygon_approach  # noqa: E402
 import stencil_approach  # noqa: E402
+from layers import eudr_layers  # noqa: E402
 
 YES_NO = {True: "yes", False: "no"}
 
@@ -194,7 +204,7 @@ def question_2(farms, idx, methods, args) -> dict:
     return out
 
 
-def test_geojson(conn, grid, args, methods, tif_info) -> None:
+def test_geojson(conn, grid, args, methods, tif_info, show_storage: bool = True) -> None:
     farms = common.load_farms(args.plots, grid, args.point_mode)
     n = len(farms)
     if not n:
@@ -234,17 +244,18 @@ def test_geojson(conn, grid, args, methods, tif_info) -> None:
             print(f"  {name:9s} {stats['mismatched']:,} of {stats['pixels']:,} pixels differ  "
                   f"-> {common.fidelity_text(stats)} (all colours, including land and forest)")
 
-    print("\n=== Storage ===")
-    file_bytes, raw_bytes = tif_info
-    print(f"  original TIFF file (compressed)     {file_bytes / 1e6:8.3f} MB")
-    print(f"  original TIFF, uncompressed pixels  {raw_bytes / 1e6:8.3f} MB")
-    shared_bytes = sum(s for s, _ in common.table_sizes(conn, [grid.table("grid_info")]).values())
-    for name, module in (("stencils", stencil_approach), ("polygons", polygon_approach)):
-        sizes = common.table_sizes(conn, [grid.table(t) for t in module.TABLES])
-        total = sum(s for s, _ in sizes.values()) + shared_bytes
-        detail = ", ".join(f"{t.rsplit('.', 1)[-1]}: {r:,} rows" for t, (s, r) in sizes.items())
-        print(f"  {name:9s} database                  {total / 1e6:8.3f} MB   ({detail})")
-    print("  (Database sizes include indexes and PostgreSQL's per-row bookkeeping.)")
+    if show_storage:
+        print("\n=== Storage ===")
+        file_bytes, raw_bytes = tif_info
+        print(f"  original TIFF file (compressed)     {file_bytes / 1e6:8.3f} MB")
+        print(f"  original TIFF, uncompressed pixels  {raw_bytes / 1e6:8.3f} MB")
+        shared_bytes = sum(s for s, _ in common.table_sizes(conn, [grid.table("grid_info")]).values())
+        for name, module in (("stencils", stencil_approach), ("polygons", polygon_approach)):
+            sizes = common.table_sizes(conn, [grid.table(t) for t in module.TABLES])
+            total = sum(s for s, _ in sizes.values()) + shared_bytes
+            detail = ", ".join(f"{t.rsplit('.', 1)[-1]}: {r:,} rows" for t, (s, r) in sizes.items())
+            print(f"  {name:9s} database                  {total / 1e6:8.3f} MB   ({detail})")
+        print("  (Database sizes include indexes and PostgreSQL's per-row bookkeeping.)")
 
     common.make_parent(args.csv)
     with open(args.csv, "w", newline="", encoding="utf-8") as fh:
@@ -267,10 +278,158 @@ def test_geojson(conn, grid, args, methods, tif_info) -> None:
     print(f"\nWrote {common.nice_path(args.csv)} (one row per farm)")
 
 
+# --------------------------------------------------------------------------------------
+# Part 2: the evidence (a map uploaded from a results folder of the compaction step)
+# --------------------------------------------------------------------------------------
+def storage_rows(summary: dict | None, folder: str, db: dict) -> list[tuple[str, int, str]]:
+    """(what, bytes, note) for each form the map takes, from the original layers to Neon.
+    summary: the compaction step's summary.json (None: the original layers are left out);
+    db: bytes per approach in Neon - "evidence", "stencils", "outlines" - and the shared "grid_info"."""
+    sizes = (summary or {}).get("sizes_bytes", {})
+    raw = sizes.get("inputs_raw_for_bbox")
+    rows = []
+    if raw:
+        rows.append(("original layers for the box, uncompressed", raw))
+    if sizes.get("inputs_clipped_deflate"):
+        rows.append(("original layers, clipped + DEFLATE", sizes["inputs_clipped_deflate"]))
+    outcome = os.path.join(folder, "outcome.tif")
+    for path, label in ((layers.evidence_file(folder), "evidence.tif (every fact, 32 bits a pixel)"),
+                        (outcome, "outcome.tif (outcome classes with years)"),
+                        (os.path.join(folder, layers.CLASS_MAP),
+                         "outcome in 5 colours (the TIFF the stencils and outlines are built from)")):
+        if os.path.isfile(path):
+            rows.append((label, os.path.getsize(path)))
+    for key, label in (("evidence", "Neon: evidence pages"), ("stencils", "Neon: stencils (5 colours)"),
+                       ("outlines", "Neon: outlines (5 colours)")):
+        if db.get(key) is not None:
+            rows.append((label, db[key] + db.get("grid_info", 0)))
+    return [(label, size, f"{100 * size / raw:.1f}% of the uncompressed layers" if raw and i else "")
+            for i, (label, size) in enumerate(rows)]
+
+
+def evidence_fidelity(rows: list[dict], reference: list[dict]) -> dict:
+    """How many plots get every output (verdict, reason, every hectare figure, the years) the same
+    as in reference, and which outputs differ where they don't."""
+    differ = [(r["plot_id"], eudr_layers.compare_outputs(r, e)) for r, e in zip(rows, reference)]
+    differ = [(pid, outputs) for pid, outputs in differ if outputs]
+    return {"plots": len(rows), "identical": len(rows) - len(differ),
+            "same_verdict": sum(r["verdict"] == e["verdict"] for r, e in zip(rows, reference)), "differ": differ}
+
+
+def one_plot_at_a_time(check, plots, sample: int) -> float:
+    """Median seconds to check ONE plot on its own (plots: a GeoDataFrame)."""
+    picks = [plots.iloc[[i]] for i in range(0, len(plots), max(1, len(plots) // sample))][:sample]
+    check(picks[0])  # warm-up
+    return statistics.median(check(p)[1]["total_s"] for p in picks)
+
+
+def evidence_part(conn, grid, folder: str, plots_path: str, args) -> None:
+    print("\n=== Part 2: the evidence - Neon vs evidence.tif vs the original layers ===")
+    try:
+        evidence_approach.ensure_built(conn, grid)
+    except SystemExit:
+        print("  This map has no evidence pages (it was uploaded from a TIFF), so part 2 is skipped.")
+        return
+    evidence = layers.evidence_file(folder)
+    rule = layers.rule_from(json.loads(layers.read_tags(evidence).get("RULE_PARAMS", "{}")))
+    jgrid = layers.joe_grid(grid)
+    row_area = eudr_layers.row_areas_m2(jgrid)
+    plots, _ = evidence_approach.read_plots(plots_path)
+    n = len(plots)
+
+    def from_file(p):
+        rows, seconds = eudr_layers.query_plots(p, evidence, jgrid, row_area, rule, args.min_plot_ha)
+        return rows, {"total_s": seconds}
+
+    def from_neon(p):
+        return evidence_approach.check(conn, grid, p, args.min_plot_ha)
+
+    print(f"  {n} plots, as eudr_layers.py reads them (a point is a circle of its declared area, 4 ha if none);"
+          f"\n  each way checks them {args.repeat} times and the median is reported.")
+    neon_rows, neon_s, timings = run_batch(from_neon, plots, args.repeat)
+    file_rows, file_s, _ = run_batch(from_file, plots, args.repeat)
+    singles = {"neon": one_plot_at_a_time(from_neon, plots, args.single),
+               "file": one_plot_at_a_time(from_file, plots, args.single)}
+    conn.rollback()                                # the checks only read: end the transaction
+
+    fid = evidence_fidelity(neon_rows, file_rows)
+    summary = layers.summary(folder) or {}
+    joe = summary.get("fidelity") or {}
+    outputs = len(neon_rows[0]) - 1 if neon_rows else 0
+    print(f"\n  Decision fidelity ({outputs} outputs a plot: verdict, reason, every hectare figure, the years)")
+    print(f"    Neon vs evidence.tif              {fid['identical']:,} of {fid['plots']:,} plots identical "
+          f"({100 * fid['identical'] / max(n, 1):.2f}%); same verdict {100 * fid['same_verdict'] / max(n, 1):.2f}%")
+    if joe.get("plots_compared"):
+        print(f"    evidence.tif vs original layers   {joe['plots_with_every_output_identical']:,} of "
+              f"{joe['plots_compared']:,} plots identical ({joe['decision_fidelity_pct']}%); same verdict "
+              f"{joe['same_verdict_pct']}%  (the compaction step's own check, --verify)")
+    else:
+        print("    evidence.tif vs original layers   not measured: build with --verify (pipeline.py passes it on)")
+    for pid, differ in fid["differ"][:10]:
+        print(f"    mismatch {pid}: {', '.join(differ)}")
+    counts = {v: sum(r["verdict"] == v for r in neon_rows) for v in dict.fromkeys(r["verdict"] for r in neon_rows)}
+    print("  Verdicts: " + ", ".join(f"{v} {c:,}" for v, c in sorted(counts.items(), key=lambda kv: -kv[1])))
+
+    print(f"\n  {'Speed':34s}{f'all {n} at once':>16s}{'per plot':>12s}{'one plot alone':>17s}")
+    for name, seconds, single in (("evidence.tif on disk (local)", file_s, singles["file"]),
+                                  ("Neon evidence pages (over Neon)", neon_s, singles["neon"])):
+        print(f"    {name:32s}{seconds:14.3f} s{1000 * seconds / max(n, 1):9.2f} ms{1000 * single:14.2f} ms")
+    if joe.get("query_ms_median"):
+        files = (joe.get("files_read_per_plot") or {}).get("original_layers")
+        print(f"    {'original layers (local, --verify)':32s}{'':16s}{joe['query_ms_median']['original_layers']:9.2f} ms"
+              f"   median, {files} files a plot")
+    print(f"  (Neon: 3 round trips per batch - tables there?, the rule, the pages; {timings['pages']} pages fetched)")
+
+    print("\n  Pixel fidelity")
+    if not args.skip_verify:
+        stats = evidence_approach.verify(conn, grid, folder)
+        print(f"    evidence pages vs evidence.tif    {stats['mismatched']:,} of {stats['pixels']:,} pixels differ "
+              f"(all 32 bits) -> {common.fidelity_text(stats)}")
+    for r in summary.get("pixel_fidelity") or []:
+        pct = "n/a" if r["exact_values_recovered_pct"] is None else f"{r['exact_values_recovered_pct']:.2f}%"
+        print(f"    {r['layer'][:46]:46s} exact {pct:>8s}  kept as {r['stored_as']}")
+
+    common.make_parent(args.csv_evidence)
+    with open(args.csv_evidence, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["plot_id", "verdict_evidence_tif", "verdict_neon", "all_outputs_match", "outputs_that_differ",
+                    "area_ha", "forest_2020_ha", "confirmed_ha", "probable_ha", "review_ha", "reason"])
+        for r, e in zip(neon_rows, file_rows):
+            differ = eudr_layers.compare_outputs(r, e)
+            w.writerow([r["plot_id"], e["verdict"], r["verdict"], not differ, " ".join(differ), r["area_ha"],
+                        r["forest_2020_ha"], r["confirmed_ha"], r["probable_ha"], r["review_ha"], r["reason"]])
+    print(f"\nWrote {common.nice_path(args.csv_evidence)} (one row per plot)")
+
+
+def storage_chain(conn, grid, folder: str) -> None:
+    print("\n=== Storage: from the original layers to Neon ===")
+    db = {"grid_info": sum(s for s, _ in common.table_sizes(conn, [grid.table("grid_info")]).values())}
+    for key, module in (("evidence", evidence_approach), ("stencils", stencil_approach), ("outlines", polygon_approach)):
+        sizes = common.table_sizes(conn, [grid.table(t) for t in module.TABLES])
+        if sizes:
+            db[key] = sum(s for s, _ in sizes.values())
+    summary = layers.summary(folder)
+    for label, size, note in storage_rows(summary, folder, db):
+        print(f"  {label:72s} {size / 1e6:9.3f} MB  {note}")
+    if summary is None:
+        print("  (No summary.json in the results folder, so the original layers are left out.)")
+    print("  (Neon sizes include indexes, PostgreSQL's per-row bookkeeping and the shared grid_info.\n"
+          "   evidence.tif and outcome.tif also hold zoomed-out copies (overviews) for viewing.)")
+
+
+def source_folder(path: str):
+    """The results folder given (its path, or its name in layers/), or None for a TIFF."""
+    for candidate in (path, os.path.join(common.ROOT_DIR, path), os.path.join(common.LAYERS_DIR, path)):
+        if os.path.isdir(candidate):
+            return layers.results_folder(candidate)
+    return None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("tif", help="TIFF file name in data/tiff/ (or a full path)")
-    ap.add_argument("plots", nargs="?", help="GeoJSON file name in data/geojson/ (or a full path)")
+    ap.add_argument("source", help="a results folder (its path, or its name in layers/), or a 5-colour TIFF")
+    ap.add_argument("plots", nargs="?",
+                    help="GeoJSON of farms (default for a results folder: its test_plots.geojson)")
     ap.add_argument("--map", help="which stored map to compare with (needed when there are several)")
     ap.add_argument("--point", nargs=2, type=float, action="append", metavar=("LON", "LAT"),
                     help="test one point: longitude first, then latitude (repeat for more points)")
@@ -281,10 +440,23 @@ def main() -> None:
     ap.add_argument("--repeat", type=int, default=3, help="timing runs per method (median is reported)")
     ap.add_argument("--single", type=int, default=20,
                     help="how many farms to also time one at a time (default 20)")
-    ap.add_argument("--skip-verify", action="store_true", help="skip the pixel-by-pixel rebuild")
+    ap.add_argument("--skip-verify", action="store_true", help="skip the pixel-by-pixel rebuilds")
+    ap.add_argument("--min-plot-ha", type=float, default=0.0,
+                    help="part 2: ignore clearing of at most this many ha per plot, as eudr_layers.py "
+                         "--min-plot-ha (default 0: the EUDR has no tolerance)")
     ap.add_argument("--csv", default=os.path.join(COMPARE_DIR, "results", "comparison.csv"),
                     help="where to write the per-farm table (default: compare/results/comparison.csv)")
+    ap.add_argument("--csv-evidence", default=os.path.join(COMPARE_DIR, "results", "comparison_evidence.csv"),
+                    help="part 2's per-plot table (default: compare/results/comparison_evidence.csv)")
     args = ap.parse_args()
+    folder = source_folder(args.source)
+    if folder:
+        args.tif = layers.class_map(folder)
+        test_plots = os.path.join(folder, "test_plots.geojson")
+        if not args.plots and os.path.isfile(test_plots):
+            args.plots = test_plots
+    else:
+        args.tif = common.find_tiff(args.source)
     if not args.plots and not args.point:
         ap.error("give a GeoJSON file of farms, or --point LON LAT (or both)")
     for lon, lat in args.point or []:
@@ -292,7 +464,6 @@ def main() -> None:
             ap.error(f"--point {lon:g} {lat:g} is not a longitude/latitude pair - "
                      "give the longitude first (e.g. 103.5), then the latitude (e.g. -1.6)")
     args.repeat, args.single = max(1, args.repeat), max(1, args.single)
-    args.tif = common.find_tiff(args.tif)
     if args.plots:
         args.plots = common.find_geojson(args.plots)
     all_touched = args.rule == "touched"
@@ -323,8 +494,12 @@ def main() -> None:
             test_points(args.point, grid, point_methods, args.repeat)
             conn.rollback()  # test points are not saved
         if args.plots:
-            print()
-            test_geojson(conn, grid, args, methods, tif_info)
+            print("\n=== Part 1: the 5 colours - stencils and outlines vs the TIFF ===" if folder else "")
+            test_geojson(conn, grid, args, methods, tif_info, show_storage=folder is None)
+            if folder:
+                evidence_part(conn, grid, folder, args.plots, args)
+        if folder:
+            storage_chain(conn, grid, folder)
 
 
 if __name__ == "__main__":

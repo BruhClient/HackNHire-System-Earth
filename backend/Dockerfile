@@ -1,13 +1,14 @@
 # Runs the programs in a container. The database stays on Neon.
-# From the project folder (eudr_storage):
+# From the backend folder:
 #
 #   docker build -t eudr-storage .
 #   docker run --rm -v "$(pwd):/project" eudr-storage database/test_connection.py
-#   docker run --rm -v "$(pwd):/project" eudr-storage database/polygon_approach.py build my_map.tif
-#   docker run --rm -v "$(pwd):/project" eudr-storage compare/compare.py my_map.tif my_plots.geojson
+#   docker run --rm -v "$(pwd):/project" -v "D:/eudr/inputs:/inputs" eudr-storage pipeline.py \
+#       --name jambi --data-dir /inputs --bbox 103.0 -2.3 103.5 -1.8 --test-plots 1000 --verify
+#   docker run --rm -v "$(pwd):/project" eudr-storage compare/compare.py layers/jambi --map jambi
 #
-# "-v ...:/project" shares your project folder with the container, so it reads your .env,
-# data/tiff and data/geojson, and writes the results/ folders back to your computer.
+# "-v ...:/project" shares your backend folder with the container, so it reads your .env and writes
+# layers/ and the results/ folders back to your computer; the second -v shares your satellite layers.
 # (Windows PowerShell: use "${PWD}:/project" instead of "$(pwd):/project".)
 FROM python:3.12-slim
 

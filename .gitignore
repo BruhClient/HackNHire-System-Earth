@@ -17,12 +17,9 @@ CLAUDE.local.md
 backend/database/results/
 backend/compare/results/
 
-# Real maps and farms are customer data - keep them out of Git
-# (only the small made-up test files may be tracked)
-backend/data/tiff/*
-!backend/data/tiff/test_map.tif
-backend/data/geojson/*
-!backend/data/geojson/test_plots.geojson
+# Satellite layers, maps and farms are customer data - keep them out of Git. The maps the
+# compaction step builds go to backend/layers/<map>/; tests make their own data in temporary folders.
+backend/layers/
 *.tif
 *.tiff
-!backend/data/tiff/test_map.tif
+*.geojson

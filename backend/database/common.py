@@ -92,17 +92,18 @@ def decide(present: set[int], water_share: float, outside: bool = False) -> str:
 
 # --------------------------------------------------------------------------------------
 # Project folders
-#   eudr_storage/            <- ROOT_DIR: .env lives here
-#   ├── data/tiff/           <- your TIFF files
-#   ├── data/geojson/        <- your farm GeoJSON files
-#   ├── database/            <- this file, the two approaches (+ results/ for their CSVs)
-#   └── compare/             <- the evaluation (+ results/ for its CSV)
+#   backend/                 <- ROOT_DIR: .env and pipeline.py live here
+#   ├── compaction/          <- step 1: satellite layers -> compact layers (eudr_layers.py)
+#   ├── database/            <- step 2: this file, the storage approaches (+ results/ for their CSVs)
+#   ├── compare/             <- the evaluation (+ results/ for its CSV)
+#   └── layers/<map>/        <- what step 1 builds, one folder per map (evidence.tif, outcome.tif,
+#                               test plots, ...). Made by pipeline.py; never in Git.
 # --------------------------------------------------------------------------------------
 DATABASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(DATABASE_DIR)
-DATA_DIR = os.path.join(ROOT_DIR, "data")
-TIFF_DIR = os.path.join(DATA_DIR, "tiff")
-GEOJSON_DIR = os.path.join(DATA_DIR, "geojson")
+COMPACTION_DIR = os.path.join(ROOT_DIR, "compaction")
+LAYERS_DIR = os.path.join(ROOT_DIR, "layers")
+TIFF_DIR = LAYERS_DIR  # where the app looks for the TIFF a map was uploaded from (grid_info.source_file)
 
 
 def nice_path(path: str) -> str:
@@ -113,22 +114,35 @@ def nice_path(path: str) -> str:
         return path
 
 
-def find_input(path: str, folder: str, what: str) -> str:
-    """Accept a full path, or just a file name that sits in data/tiff or data/geojson."""
-    for candidate in (path, os.path.join(ROOT_DIR, path), os.path.join(folder, path),
-                      os.path.join(DATA_DIR, path)):
+def find_input(path: str, what: str) -> str:
+    """Accept a full path, a path from the backend folder, or a path inside layers/
+    (e.g. jambi/test_plots.geojson)."""
+    for candidate in (path, os.path.join(ROOT_DIR, path), os.path.join(LAYERS_DIR, path)):
         if os.path.isfile(candidate):
             return candidate
     sys.exit(f"Can't find the {what} file '{path}'.\n"
-             f"Put it in {nice_path(folder)}{os.sep} and give just its name, or give the full path.")
+             f"Give its full path, or its path inside {nice_path(LAYERS_DIR)}{os.sep} "
+             f"(e.g. jambi{os.sep}test_plots.geojson).")
 
 
 def find_tiff(path: str) -> str:
-    return find_input(path, TIFF_DIR, "TIFF")
+    return find_input(path, "TIFF")
 
 
 def find_geojson(path: str) -> str:
-    return find_input(path, GEOJSON_DIR, "GeoJSON")
+    return find_input(path, "GeoJSON")
+
+
+def stored_path(path: str) -> str:
+    """How a file is named in the database: its path inside layers/ (e.g. 'jambi/outcome_5class.tif',
+    so the app can find it again), else just its file name."""
+    try:
+        inside = os.path.relpath(os.path.abspath(path), LAYERS_DIR)
+    except ValueError:  # on a different drive (Windows)
+        return os.path.basename(path)
+    if inside.startswith(os.pardir) or os.path.isabs(inside):
+        return os.path.basename(path)
+    return inside.replace(os.sep, "/")
 
 
 # --------------------------------------------------------------------------------------
@@ -204,8 +218,10 @@ CREATE TABLE IF NOT EXISTS public.maps (
     added_at     TIMESTAMPTZ DEFAULT now()
 )"""
 
-NO_MAP_MESSAGE = ("No map in the database yet - upload one first, e.g.\n"
-                  "  python database/maps.py upload my_map.tif --name jambi-v1")
+NO_MAP_MESSAGE = ("No map in the database yet - build and upload one first, e.g.\n"
+                  "  python pipeline.py --name jambi --data-dir YOUR_LAYERS --bbox 103.0 -2.3 103.5 -1.8\n"
+                  "or upload a results folder you already have:\n"
+                  "  python database/maps.py upload layers/jambi --name jambi")
 OLD_LAYOUT_MESSAGE = ("Your map is stored the old way (one map in the public schema). Move it into "
                       "the new layout first - it takes a second and nothing is re-uploaded:\n"
                       "  python database/maps.py migrate")
@@ -473,13 +489,13 @@ def save_grid(conn: psycopg.Connection, grid: Grid, source_file: str) -> None:
             "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (grid.map_version, grid.x0, grid.y0, grid.pixel_w, grid.pixel_h, grid.width,
              grid.height, grid.srid, grid.geographic, grid.default_class, grid.fingerprint,
-             os.path.basename(source_file)))
+             stored_path(source_file)))
         cur.execute(
             "INSERT INTO public.maps (name, schema_name, source_file, fingerprint, width, height) "
             "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (name) DO UPDATE SET "
             "schema_name = EXCLUDED.schema_name, source_file = EXCLUDED.source_file, "
             "fingerprint = EXCLUDED.fingerprint, width = EXCLUDED.width, height = EXCLUDED.height",
-            (grid.map_version, grid.schema, os.path.basename(source_file), grid.fingerprint,
+            (grid.map_version, grid.schema, stored_path(source_file), grid.fingerprint,
              grid.width, grid.height))
 
 
@@ -526,7 +542,7 @@ def load_grid(conn: psycopg.Connection, name: str | None = None) -> Grid:
     if row is None or row[9] is None or row[10] is None:
         sys.exit(f"The map '{map_name}' is incomplete in the database. Delete it and upload it again:\n"
                  f"  python database/maps.py delete \"{map_name}\" --yes\n"
-                 f"  python database/maps.py upload my_map.tif --name \"{map_name}\"")
+                 f"  python database/maps.py upload layers/YOUR_FOLDER --name \"{map_name}\"")
     return Grid(*row, schema=schema)
 
 
@@ -632,8 +648,8 @@ def same_grid_or_exit(src, grid: Grid) -> Grid:
     tif_grid = Grid.from_dataset(src, grid.map_version)
     if tif_grid != grid:
         sys.exit(f"This TIFF is not the map '{grid.map_version}' in the database (different size or "
-                 "location). Check --map, or upload this TIFF as a map of its own:\n"
-                 "  python database/maps.py upload my_map.tif --name NAME")
+                 "location). Check --map, or upload it as a map of its own:\n"
+                 "  python database/maps.py upload layers/YOUR_FOLDER --name NAME")
     return tif_grid
 
 
@@ -733,6 +749,17 @@ def _polygonal(geom):
     return shapely.unary_union(parts) if parts else None
 
 
+def read_features(path: str) -> list[dict]:
+    """The features of a GeoJSON file: a FeatureCollection, one Feature, or a bare shape."""
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if data.get("type") == "FeatureCollection":
+        return data["features"]
+    if data.get("type") == "Feature":
+        return [data]
+    return [{"type": "Feature", "properties": {}, "geometry": data}]  # e.g. {"type": "Polygon", ...}
+
+
 def load_farms(path: str, grid: Grid, point_mode: str = "pixel") -> list[Farm]:
     """Read farms from a GeoJSON file (coordinates are longitude/latitude, EPSG:4326).
 
@@ -740,15 +767,7 @@ def load_farms(path: str, grid: Grid, point_mode: str = "pixel") -> list[Farm]:
       "pixel"  - a point is checked against the single pixel it lands on
       "circle" - a point is turned into a circle with its declared area (stricter)
     """
-    with open(path, encoding="utf-8") as fh:
-        data = json.load(fh)
-    if data.get("type") == "FeatureCollection":
-        features = data["features"]
-    elif data.get("type") == "Feature":
-        features = [data]
-    else:  # a bare shape, e.g. {"type": "Polygon", "coordinates": ...}
-        features = [{"type": "Feature", "properties": {}, "geometry": data}]
-    farms = farms_from_features(features, grid, point_mode)
+    farms = farms_from_features(read_features(path), grid, point_mode)
     print(f"Loaded {len(farms)} farm{'' if len(farms) == 1 else 's'} from {os.path.basename(path)} "
           f"({sum(f.kind == 'point' for f in farms)} points, "
           f"{sum(f.kind == 'outline' for f in farms)} outlines)")
@@ -762,22 +781,38 @@ def farms_from_points(points: list[tuple[float, float]], grid: Grid) -> list[Far
     return farms_from_features(features, grid)
 
 
+def plot_ids(features: list[dict]) -> list[str]:
+    """One id per GeoJSON feature: its plot_id, id or ProductionPlace (the EU Information System's
+    name, used by eudr_layers.py's test plots), else plot-<n>. Repeats become <id>-2, <id>-3, ..."""
+    ids, seen = [], Counter()
+    for i, feat in enumerate(features):
+        props = feat.get("properties") or {}
+        plot_id = str(props.get("plot_id") or props.get("id") or props.get("ProductionPlace")
+                      or feat.get("id") or f"plot-{i + 1}")
+        seen[plot_id] += 1
+        if seen[plot_id] > 1:
+            plot_id = f"{plot_id}-{seen[plot_id]}"
+            print(f"Warning: duplicate plot id, renamed to {plot_id}")
+        ids.append(plot_id)
+    return ids
+
+
+def declared_area(props: dict) -> float | None:
+    """A farm's declared size in hectares (area_ha, declared_ha, area, or the EU format's Area)."""
+    declared = props.get("area_ha", props.get("declared_ha", props.get("area", props.get("Area"))))
+    return float(declared) if declared not in (None, "") else None
+
+
 def farms_from_features(features: list[dict], grid: Grid, point_mode: str = "pixel") -> list[Farm]:
     """GeoJSON features -> farms in the map's coordinate system."""
     to_map = None
     if grid.srid != 4326:
         to_map = Transformer.from_crs(4326, grid.srid, always_xy=True).transform
 
-    farms, seen = [], Counter()
-    for i, feat in enumerate(features):
+    farms = []
+    for feat, plot_id in zip(features, plot_ids(features)):
         props = feat.get("properties") or {}
-        plot_id = str(props.get("plot_id") or props.get("id") or feat.get("id") or f"plot-{i + 1}")
-        seen[plot_id] += 1
-        if seen[plot_id] > 1:
-            plot_id = f"{plot_id}-{seen[plot_id]}"
-            print(f"Warning: duplicate plot id, renamed to {plot_id}")
-        declared = props.get("area_ha", props.get("declared_ha", props.get("area")))
-        declared = float(declared) if declared not in (None, "") else None
+        declared = declared_area(props)
 
         if not feat.get("geometry"):
             print(f"Skipping {plot_id}: no geometry")

@@ -17,12 +17,14 @@ Three things keep the checks fast:
   * Before a big query, PostgreSQL's JIT compiler is switched off: it spent ~150 ms compiling
     the overlap query, which then ran in ~65 ms (see common.no_jit).
 
-Commands (run from the project folder; give just the file name - TIFFs are looked up
-in data/tiff/ and GeoJSONs in data/geojson/ - or a full path)
-    python database/polygon_approach.py build  test_map.tif [--map NAME]
-    python database/polygon_approach.py check  test_plots.geojson [--map NAME] [--point-mode pixel|circle] [--csv FILE]
-    python database/polygon_approach.py verify test_map.tif [--map NAME]
-(To upload a new map with both approaches at once, use database/maps.py upload.)
+The colours are the compaction step's outcome in 5 colours (layers/<map>/outcome_5class.tif, see
+layers.py), or any TIFF in the 5 colours.
+
+Commands (run from the backend folder; give a path, or a path inside layers/)
+    python database/polygon_approach.py build  jambi/outcome_5class.tif [--map NAME]
+    python database/polygon_approach.py check  jambi/test_plots.geojson [--map NAME] [--point-mode pixel|circle] [--csv FILE]
+    python database/polygon_approach.py verify jambi/outcome_5class.tif [--map NAME]
+(To upload a new map with every approach at once, use database/maps.py upload.)
 
 Tables (in the map's own schema, next to the shared ones in common.py)
     class_polys     one row per outline: its colour and its shape (with a spatial index)
@@ -85,7 +87,7 @@ def ensure_built(conn, grid: common.Grid) -> None:
             and common.table_exists(conn, grid.table("square_labels"))):
         raise SystemExit(f"The map '{grid.map_version}' has no outlines yet (or they were made by an older "
                          "version). Build them first:\n"
-                         f"  python database/polygon_approach.py build my_map.tif --map \"{grid.map_version}\"")
+                         f"  python database/polygon_approach.py build jambi/outcome_5class.tif --map \"{grid.map_version}\"")
 
 
 # --------------------------------------------------------------------------------------
@@ -300,17 +302,17 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("build", help="trace the TIFF and upload the outlines")
-    b.add_argument("tif", help="TIFF file name in data/tiff/ (or a full path)")
-    b.add_argument("--map", help="the map's name (default: the TIFF's file name, e.g. my_map)")
+    b.add_argument("tif", help="the 5-colour TIFF (a path, or a path inside layers/, e.g. jambi/outcome_5class.tif)")
+    b.add_argument("--map", help="the map's name (default: the TIFF's file name)")
     c = sub.add_parser("check", help="give a verdict for every farm in a GeoJSON file")
-    c.add_argument("plots", help="GeoJSON file name in data/geojson/ (or a full path)")
+    c.add_argument("plots", help="GeoJSON of farms (a path, or a path inside layers/, e.g. jambi/test_plots.geojson)")
     c.add_argument("--map", help="which stored map to check against (needed when there are several)")
     c.add_argument("--point-mode", choices=["pixel", "circle"], default="pixel",
                    help="pixel: check the pixel under each point; circle: use the declared area")
     c.add_argument("--csv", default=os.path.join(common.DATABASE_DIR, "results", "results_polygons.csv"),
                    help="where to write the verdicts (default: database/results/results_polygons.csv)")
     v = sub.add_parser("verify", help="rebuild the map from the database and compare it with the TIFF")
-    v.add_argument("tif", help="TIFF file name in data/tiff/ (or a full path)")
+    v.add_argument("tif", help="the 5-colour TIFF (a path, or a path inside layers/, e.g. jambi/outcome_5class.tif)")
     v.add_argument("--map", help="which stored map to rebuild (needed when there are several)")
     args = ap.parse_args()
     if args.cmd == "check":

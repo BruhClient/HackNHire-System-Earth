@@ -6,10 +6,11 @@
 database/results/
 compare/results/
 **/__pycache__/
+venv/
 .venv/
 
-# Your own maps and farms are shared at run time with -v, not copied into the image
-data/tiff/*
-!data/tiff/test_map.tif
-data/geojson/*
-!data/geojson/test_plots.geojson
+# Your maps, layers and farms are shared at run time with -v, not copied into the image
+layers/
+*.tif
+*.tiff
+*.geojson

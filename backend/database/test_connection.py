@@ -3,7 +3,7 @@ test_connection.py - check that your Neon database is reachable before uploading
 
     python database/test_connection.py
 
-It reads DATABASE_URL from the .env file in the project folder, prints the PostgreSQL
+It reads DATABASE_URL from the .env file in the backend folder, prints the PostgreSQL
 version, switches on PostGIS (needed by the outlines approach) and lists the tables
 that are already in the database.
 """
@@ -32,9 +32,9 @@ def main() -> None:
             tables = [row[0] for row in cur.fetchall()]
             print(f"  Tables already here: {', '.join(tables) if tables else 'none yet'}")
         conn.commit()
-    print("All good - next, upload a map, e.g.:\n"
-          "  python database/polygon_approach.py build my_map.tif\n"
-          "  python database/stencil_approach.py build my_map.tif")
+    print("All good - next, build a map from your satellite layers and upload it, e.g.:\n"
+          "  python pipeline.py --name jambi --data-dir YOUR_LAYERS --bbox 103.0 -2.3 103.5 -1.8 "
+          "--test-plots 1000 --verify")
 
 
 if __name__ == "__main__":

@@ -1,15 +1,24 @@
 """
 maps.py - several maps in one Neon database, each in its own schema (a folder of tables).
 
-    public.maps     the list of maps: name, schema, source TIFF, fingerprint, size
-    map_<name>      grid_info, stencil_pages, class_polys, square_labels, plots, plot_results
+    public.maps     the list of maps: name, schema, source file, fingerprint, size
+    map_<name>      grid_info, stencil_pages, class_polys, square_labels, evidence_info,
+                    evidence_pages, plots, plot_results, evidence_results
 
 A map's schema comes from its name: 'Jambi v1' -> map_jambi_v1 (common.map_schema). Every query
 names its tables with the schema (grid.table(...)), so maps never mix.
 
-Commands (run from the project folder; TIFFs are looked up in data/tiff/, or give a full path)
+What to upload:
+  * a results folder of the compaction step (layers/<map>/, made by pipeline.py): all three
+    approaches - the stencils and outlines store its outcome in 5 colours, the evidence pages store
+    evidence.tif (every decision fact, with the years and sources)
+  * or a TIFF in the 5 colours (0 land, 1 water, 2 forest, 3 deforestation, 4 needs review): the
+    stencils and outlines only - this is what the app uploads
+
+Commands (run from the backend folder; give a path, or a name inside layers/)
     python database/maps.py list
-    python database/maps.py upload my_map.tif [--name "Jambi v1"]   # both approaches at once
+    python database/maps.py upload layers/jambi [--name "Jambi v1"]  # a results folder: all three approaches
+    python database/maps.py upload my_map.tif [--name "Jambi v1"]    # a 5-colour TIFF: stencils + outlines
     python database/maps.py rename "Jambi v1" "Jambi 2024"           # its schema follows the name
     python database/maps.py delete "Jambi v1" --yes                  # can't be undone
     python database/maps.py migrate [--name jambi-v1]                # a map stored the old way
@@ -18,6 +27,7 @@ upload is ONE transaction: if anything fails, or you press Ctrl+C, nothing is le
 """
 
 import argparse
+import os
 import sys
 import time
 
@@ -28,8 +38,9 @@ import polygon_approach
 import stencil_approach
 
 MAX_PIXELS = 100_000_000   # the app keeps the whole map in memory: 1 byte per pixel
-MAP_TABLES = ["grid_info", "stencil_pages", "class_polys", "square_labels", "plots", "plot_results"]
-UPLOAD_STEPS = 7           # stencils: read, pack, index; outlines: read, trace, index; tidy up
+MAP_TABLES = ["grid_info", "stencil_pages", "class_polys", "square_labels", "evidence_info", "evidence_pages",
+              "plots", "plot_results", "evidence_results"]
+UPLOAD_STEPS = 7           # a TIFF: stencils: read, pack, index; outlines: read, trace, index; tidy up
 
 
 def size_problem(width: int, height: int) -> str:
@@ -41,34 +52,48 @@ def size_problem(width: int, height: int) -> str:
             "Crop it into smaller areas first.")
 
 
-def list_maps(conn) -> list[dict]:
-    """Every stored map, by name: where it lives, its TIFF, its size and which approaches it has."""
+def list_maps(conn, with_evidence: bool = False) -> list[dict]:
+    """Every stored map, by name: where it lives, its source file, its size and which approaches it
+    has. with_evidence: also whether it has evidence pages ("evidence")."""
     if not common.table_exists(conn, "public.maps"):
         if common.table_exists(conn, "public.grid_info"):
             sys.exit(common.OLD_LAYOUT_MESSAGE)
         return []
+    evidence = ",\n                   to_regclass(m.schema_name || '.evidence_pages') IS NOT NULL" \
+        if with_evidence else ""
     with conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT m.name, m.schema_name, m.source_file, m.width, m.height, m.added_at,
                    to_regclass(m.schema_name || '.stencil_pages') IS NOT NULL,
                    to_regclass(m.schema_name || '.class_polys') IS NOT NULL
-                       AND to_regclass(m.schema_name || '.square_labels') IS NOT NULL
+                       AND to_regclass(m.schema_name || '.square_labels') IS NOT NULL{evidence}
             FROM public.maps m
             WHERE to_regnamespace(m.schema_name) IS NOT NULL
             ORDER BY lower(m.name)""")
         rows = cur.fetchall()
-    return [{"name": name, "schema": schema, "source_file": source, "width": width, "height": height,
-             "added_at": added.isoformat() if added else None, "stencils": bool(stencils),
-             "outlines": bool(outlines)}
-            for name, schema, source, width, height, added, stencils, outlines in rows]
+    stored = []
+    for name, schema, source, width, height, added, stencils, outlines, *more in rows:
+        stored.append({"name": name, "schema": schema, "source_file": source, "width": width, "height": height,
+                       "added_at": added.isoformat() if added else None, "stencils": bool(stencils),
+                       "outlines": bool(outlines)})
+        if with_evidence:
+            stored[-1]["evidence"] = bool(more[0])
+    return stored
 
 
-def upload(conn, tif: str, name: str, report=None) -> common.Grid:
-    """A new map with BOTH approaches, in one transaction: if anything fails or is cancelled
-    (report may raise), everything is rolled back and the database is as it was. Then the new
-    tables are packed (VACUUM ANALYZE), which can't run inside a transaction."""
+def upload(conn, source: str, name: str, report=None) -> common.Grid:
+    """A new map, in one transaction: if anything fails or is cancelled (report may raise),
+    everything is rolled back and the database is as it was. Then the new tables are packed
+    (VACUUM ANALYZE), which can't run inside a transaction.
+    source: a results folder of the compaction step (all three approaches), or a 5-colour TIFF
+    (stencils and outlines)."""
     name = (name or "").strip()
     common.map_schema(name)  # stops here if the name can't be used
+    results, tif = None, source
+    if os.path.isdir(source):
+        import layers  # the compaction step's code (and its packages) is only needed for a results folder
+        results = layers.results_folder(source)
+        tif = layers.class_map(results)
     has_catalogue = common.table_exists(conn, "public.maps")
     if not has_catalogue and common.table_exists(conn, "public.grid_info"):
         sys.exit(common.OLD_LAYOUT_MESSAGE)
@@ -86,6 +111,9 @@ def upload(conn, tif: str, name: str, report=None) -> common.Grid:
     try:
         stencil_approach.build(conn, tif, name, report, tidy=False)
         grid = polygon_approach.build(conn, tif, name, report, tidy=False)
+        if results is not None:
+            import evidence_approach
+            evidence_approach.build(conn, results, name, report, tidy=False)
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -98,14 +126,24 @@ def upload(conn, tif: str, name: str, report=None) -> common.Grid:
             except Exception:  # noqa: BLE001 - e.g. the app's Cancelled: too late, finish tidying
                 pass
 
-    tables = [grid.table(t) for t in ("stencil_pages", "class_polys", "square_labels")]
+    built = ["stencil_pages", "class_polys", "square_labels"] + (["evidence_pages"] if results else [])
+    tables = [grid.table(t) for t in built]
     for i, table in enumerate(tables):
         tell("tidying up", i, len(tables))
         common.tidy_up(conn, table)
     tell("tidying up", len(tables), len(tables))
-    print(f"Uploaded '{name}' (both approaches) in {time.perf_counter() - start:.1f} s")
+    what = "all three approaches" if results else "both approaches"
+    print(f"Uploaded '{name}' ({what}) in {time.perf_counter() - start:.1f} s")
     common.print_storage(conn, [grid.table(t) for t in MAP_TABLES])
     return grid
+
+
+def upload_source(path: str) -> str:
+    """What maps.py upload was given: a results folder (its path, or its name in layers/), else a TIFF."""
+    for folder in (path, os.path.join(common.ROOT_DIR, path), os.path.join(common.LAYERS_DIR, path)):
+        if os.path.isdir(folder):
+            return folder
+    return common.find_tiff(path)
 
 
 def describe(conn, name: str) -> dict:
@@ -217,13 +255,14 @@ def migrate(conn, name: str | None = None) -> str:
 
 def print_list(stored: list[dict]) -> None:
     if not stored:
-        print("No maps stored yet. Upload one with:\n"
-              "  python database/maps.py upload my_map.tif --name NAME")
+        print("No maps stored yet. Build and upload one with:\n"
+              "  python pipeline.py --name NAME --data-dir YOUR_LAYERS --bbox XMIN YMIN XMAX YMAX")
         return
     for m in stored:
-        built = " + ".join(a for a, ok in (("stencils", m["stencils"]), ("outlines", m["outlines"])) if ok)
+        built = " + ".join(a for a, ok in (("stencils", m["stencils"]), ("outlines", m["outlines"]),
+                                           ("evidence", m.get("evidence"))) if ok)
         size = f"{m['width'] or 0:,} x {m['height'] or 0:,} px"
-        print(f"  {m['name']:<24} {m['schema']:<26} {size:>18}  {m['source_file'] or '':<20} "
+        print(f"  {m['name']:<24} {m['schema']:<26} {size:>18}  {m['source_file'] or '':<26} "
               f"{built or 'nothing built'}")
 
 
@@ -232,9 +271,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list", help="list the maps stored in the database")
-    u = sub.add_parser("upload", help="upload a TIFF as a new map (builds both approaches)")
-    u.add_argument("tif", help="TIFF file name in data/tiff/ (or a full path)")
-    u.add_argument("--name", help="the map's name (default: the TIFF's file name, e.g. my_map)")
+    u = sub.add_parser("upload", help="upload a results folder (all three approaches) or a 5-colour TIFF "
+                                      "(stencils and outlines) as a new map")
+    u.add_argument("source", help="a results folder (its path, or its name in layers/), or a TIFF")
+    u.add_argument("--name", help="the map's name (default: the folder's or the TIFF's name, e.g. jambi)")
     r = sub.add_parser("rename", help="give a map a new name (nothing is copied)")
     r.add_argument("name", help="the map's name now (see: list)")
     r.add_argument("new_name", help="its new name")
@@ -247,13 +287,13 @@ def main() -> None:
     if args.cmd == "delete" and not args.yes:
         sys.exit(f"This deletes the map '{args.name}' and everything stored with it, for good. "
                  "Add --yes to go ahead.")
-    tif = common.find_tiff(args.tif) if args.cmd == "upload" else None
+    source = upload_source(args.source) if args.cmd == "upload" else None
 
     with common.connect() as conn:
         if args.cmd == "list":
-            print_list(list_maps(conn))
+            print_list(list_maps(conn, with_evidence=True))
         elif args.cmd == "upload":
-            upload(conn, tif, args.name or common.default_map_name(tif))
+            upload(conn, source, args.name or common.default_map_name(os.path.normpath(source)))
         elif args.cmd == "rename":
             info = rename(conn, args.name, args.new_name)
             print(f"Renamed '{info['old']}' to '{info['name']}' (schema {info['schema']}).")

@@ -9,11 +9,12 @@ CLAUDE.local.md
 database/results/
 compare/results/
 __pycache__/
+venv/
 .venv/
 
-# Maps can be huge, and farm files are customer data - keep them out of Git
-# (the small made-up test files are kept)
-data/tiff/*
-!data/tiff/test_map.tif
-data/geojson/*
-!data/geojson/test_plots.geojson
+# The maps the compaction step builds (one folder per map) are customer data, and big - never in Git.
+# Satellite layers, maps and farm files are customer data too, wherever they are.
+layers/
+*.tif
+*.tiff
+*.geojson

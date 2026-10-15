@@ -16,13 +16,15 @@ Needs only plain PostgreSQL - no PostGIS. Checking a farm:
     outline -> unzip the pages it covers, AND the farm's own stencil with each colour's
                stencil, and count the 1s left over (= pixels where they overlap)
 
-Commands (run from the project folder; give just the file name - TIFFs are looked up
-in data/tiff/ and GeoJSONs in data/geojson/ - or a full path)
-    python database/stencil_approach.py build  test_map.tif [--map NAME]
-    python database/stencil_approach.py check  test_plots.geojson [--map NAME] [--rule touched|centre]
+The colours are the compaction step's outcome in 5 colours (layers/<map>/outcome_5class.tif, see
+layers.py), or any TIFF in the 5 colours.
+
+Commands (run from the backend folder; give a path, or a path inside layers/)
+    python database/stencil_approach.py build  jambi/outcome_5class.tif [--map NAME]
+    python database/stencil_approach.py check  jambi/test_plots.geojson [--map NAME] [--rule touched|centre]
                                                [--point-mode pixel|circle] [--csv FILE]
-    python database/stencil_approach.py verify test_map.tif [--map NAME]
-(To upload a new map with both approaches at once, use database/maps.py upload.)
+    python database/stencil_approach.py verify jambi/outcome_5class.tif [--map NAME]
+(To upload a new map with every approach at once, use database/maps.py upload.)
 
 Table (in the map's own schema, next to the shared ones in common.py)
     stencil_pages   one row per page: (page_col, page_row, stencils)
@@ -90,7 +92,7 @@ def unzip_page(blob: bytes, height: int, width: int) -> np.ndarray:
 def ensure_built(conn, grid: common.Grid) -> None:
     if not common.table_exists(conn, grid.table("stencil_pages")):
         raise SystemExit(f"The map '{grid.map_version}' has no stencils yet - build them first:\n"
-                         f"  python database/stencil_approach.py build my_map.tif --map \"{grid.map_version}\"")
+                         f"  python database/stencil_approach.py build jambi/outcome_5class.tif --map \"{grid.map_version}\"")
 
 
 # --------------------------------------------------------------------------------------
@@ -258,10 +260,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("build", help="pack the TIFF into zipped 64-bit squares and upload them")
-    b.add_argument("tif", help="TIFF file name in data/tiff/ (or a full path)")
-    b.add_argument("--map", help="the map's name (default: the TIFF's file name, e.g. my_map)")
+    b.add_argument("tif", help="the 5-colour TIFF (a path, or a path inside layers/, e.g. jambi/outcome_5class.tif)")
+    b.add_argument("--map", help="the map's name (default: the TIFF's file name)")
     c = sub.add_parser("check", help="give a verdict for every farm in a GeoJSON file")
-    c.add_argument("plots", help="GeoJSON file name in data/geojson/ (or a full path)")
+    c.add_argument("plots", help="GeoJSON of farms (a path, or a path inside layers/, e.g. jambi/test_plots.geojson)")
     c.add_argument("--map", help="which stored map to check against (needed when there are several)")
     c.add_argument("--rule", choices=["touched", "centre"], default="touched",
                    help="touched: every pixel that overlaps an outline counts (cautious); "
@@ -271,7 +273,7 @@ def main() -> None:
     c.add_argument("--csv", default=os.path.join(common.DATABASE_DIR, "results", "results_stencils.csv"),
                    help="where to write the verdicts (default: database/results/results_stencils.csv)")
     v = sub.add_parser("verify", help="rebuild the map from the database and compare it with the TIFF")
-    v.add_argument("tif", help="TIFF file name in data/tiff/ (or a full path)")
+    v.add_argument("tif", help="the 5-colour TIFF (a path, or a path inside layers/, e.g. jambi/outcome_5class.tif)")
     v.add_argument("--map", help="which stored map to rebuild (needed when there are several)")
     args = ap.parse_args()
     if args.cmd == "check":
