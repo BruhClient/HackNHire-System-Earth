@@ -38,7 +38,7 @@ Both give the same verdict on every test farm so far: 1,111 of 1,111 in the app'
 - **Speed claims must be honest.** Give medians of several runs, say "over Neon" (or local), and label EXPLAIN numbers as warm re-runs.
 - **Wording:** plain English and British spelling (colour, metres). Error messages say how to fix the problem.
 - **Dependencies:** none beyond each folder's `requirements.txt`.
-- **Commits:** this folder is a local git repository (branch `main`, no remote yet). Commit only when the user asks. `.gitignore` keeps out `.env`, the venvs and every real TIFF and GeoJSON; check `git status` before committing.
+- **Commits:** this folder is a git repository (branch `main`, remote `origin` = github.com/BruhClient/HackNHire-System-Earth, private). Commit only when the user asks. `.gitignore` keeps out `.env`, the venvs and every real TIFF and GeoJSON; check `git status` before committing.
 
 ## Quick commands (from `HackNHire\`, PowerShell)
 
