@@ -1,12 +1,49 @@
 # CLAUDE.md
 
-Student prototype for a SystemEarth challenge: store an EUDR map for rubber farms in Jambi,
-Indonesia in a Neon PostgreSQL database, compactly and with nothing lost, then check farm plots
-(GeoJSON points and polygons) against it. Two approaches compete against the original TIFF on
-storage, query speed, decision fidelity and pixel fidelity. The brief also asks for an EUDR layer
-analysis, an encoding strategy and, as a bonus, a cost estimate. SystemEarth's CTO said a local
-demo is fine and to containerise it (`Dockerfile`); the stencil idea is his. `README.md` is the
-user guide and holds the published results.
+Student prototype for a SystemEarth challenge, in two steps:
+1. **Compaction** (`compaction/eudr_layers.py`, Joe's code). It is copied unchanged from
+   github.com/Joeongtengkiat/HacknHire, version 1.1 of 14 Oct 2026.
+   - It turns about 20 satellite layers into `evidence.tif` (every EUDR decision fact per pixel,
+     17 fields in 32 bits) and `outcome.tif`, in a results folder `layers/<map>/`.
+   - Its `--verify` checks them against the original layers.
+2. **Storage in Neon** (`database/`). The results folder becomes a map with three approaches:
+   - evidence pages: `evidence.tif` itself; checks run Joe's rule;
+   - stencils and outlines: the 5 colours (what the app uses).
+
+   They compete on storage, query speed, decision fidelity and pixel fidelity.
+
+`pipeline.py` runs both steps.
+
+Also:
+- The brief also asks for an EUDR layer analysis, an encoding strategy and, as a bonus, a cost
+  estimate.
+- SystemEarth's CTO said a local demo is fine and to containerise it (`Dockerfile`). The stencil
+  idea is his.
+- `README.md` is the user guide and holds the results.
+
+## Joe's code and the EUDR rule
+- **The rule lives only in `eudr_layers.py`** (`decide`, `plot_facts`, `plot_verdict`, `judge`).
+  - Never re-implement or edit it here: import it (`layers.eudr_layers`).
+  - To take a newer version from Joe, replace the file and run the tests. `layers.py` is the only
+    glue: 5 colours, rule parameters, bit layout, grid.
+  - Joe's newer versions (1.4+) write `outcome.tif` in the 5 colours already (tag
+    `OUTCOME_SCHEME`). `layers.class_map` uses such a file as it is.
+- **`layers.five_classes` maps Joe's classes to the 5 colours:**
+
+  | Joe's classes | Colour |
+  |---|---|
+  | not forest, cleared non-forest | land |
+  | forest, rubber-map forest, damaged forest | forest |
+  | confirmed | deforestation |
+  | probable, needs review | needs review |
+  | water | water |
+  | no data | 255 (read as no data) |
+
+  This matches Joe's 1.4 legend. It was checked on Jambi: between his 1.0 and 1.4 outputs, land,
+  water and the 2020-forest total agree pixel for pixel.
+- **The evidence check must give every plot exactly `eudr_layers.query_plots`' 35 outputs.** It
+  uses the same `plot_window`, `plot_mask` and `judge`, with row areas from `layers.joe_grid`.
+  `tests/test_evidence.py` proves it; keep it that way.
 
 ## The map and the rules
 Each TIFF pixel holds one value:
@@ -35,6 +72,11 @@ Each TIFF pixel holds one value:
   Stencils are compared with the TIFF using the pixel rule, outlines using exact areas.
 
 ## Layout
+- `pipeline.py`: compaction -> upload -> check the plots against Neon and compare with `evidence.tif`.
+- `compaction/eudr_layers.py` (Joe's), `compaction/make_test_layers.py` (made-up satellite layers).
+- `database/layers.py`: a results folder as the database sees it (`results_folder`, `class_map`,
+  `rule_from`, `check_layout`, `joe_grid`). Imports `eudr_layers` (needs scipy and pandas).
+- `database/evidence_approach.py`: evidence pages (`build` / `check` / `verify` / `read_plots`).
 - `database/common.py`: shared rules, `Grid`, farm loading, results and the TIFF baseline
   (`check_with_tiff`). Imported by the others, never run.
 - `database/polygon_approach.py`: outlines in PostGIS (`build` / `check` / `verify`).
@@ -43,102 +85,49 @@ Each TIFF pixel holds one value:
 - `database/maps.py`: several maps, one schema each (`list` / `upload` both approaches / `rename` / `delete` /
   `migrate`). `public.maps` is the catalogue.
 - `compare/compare.py`: the evaluation. It imports the database modules through `sys.path`.
-- `data/tiff/`, `data/geojson/`: inputs. Scripts take a bare file name and look there.
-  `data/make_test_data.py` makes the synthetic test map and farms.
+- `layers/<map>/`: results folders (built, never in Git). There is no `data/` folder: inputs are paths.
+- `tests/`: the backend's unit tests (fake connection, made-up layers) and `smoke_pipeline.py`.
 
 ## Commands
-Run everything from the project root (the folder with `README.md`). Commands must also work in
-Windows PowerShell: use `py` if `python` isn't found, put file names with spaces in quotes, and
-don't rely on shell wildcards. To open PowerShell there: open the folder in File Explorer, click
-the address bar, type `powershell` and press Enter.
+Run everything from the backend folder with `venv\Scripts\python`. In PowerShell, put paths with
+spaces in quotes.
+```
+python database/test_connection.py                                  # should print "All good"
+python database/maps.py list                                         # ALWAYS before writing
+python pipeline.py --name NAME --data-dir LAYERS --bbox XMIN YMIN XMAX YMAX --test-plots 1000 --verify
+python pipeline.py --name NAME --out-dir layers/NAME --skip-build    # upload a built folder
+python database/evidence_approach.py check FARMS.geojson --map NAME
+python database/evidence_approach.py verify NAME --map NAME          # results folder by name in layers/
+python compare/compare.py NAME --map NAME                            # the evaluation
+python -m unittest discover -s tests -t .                            # unit tests (no database)
+python tests/smoke_pipeline.py                                       # live, on a throwaway map only
+python -m pyflakes database compare pipeline.py tests compaction/make_test_layers.py
+```
+IMPORTANT: the user's Neon database holds their real maps:
+- `Indonesia1` (schema `map_indonesia1`): the Jambi map in 5 colours;
+- `outcome (3)` (schema `map_outcome_3`).
 
-### First-time setup
-```
-python -m venv .venv                  # optional, once
-.venv\Scripts\activate                # every new terminal; macOS/Linux: source .venv/bin/activate
-pip install -r requirements.txt
-copy .env.example .env                # then paste the Neon connection string into .env (macOS/Linux: cp)
-python database/test_connection.py    # should print "All good"
-```
-If PowerShell refuses to run the activate script, run
-`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once.
+Both were uploaded from 5-colour TIFFs, so they have no evidence pages.
+- `maps.py delete X` drops map X's schema for good. A `build --map X` replaces its tables.
+- Never upload over, rename, build or delete a map you didn't create without asking.
+- Test maps get their own name (`zz ...`) and are deleted afterwards. The smoke test does this.
 
-### The user's own map and farms
-The user's files are in `data/tiff/` and `data/geojson/` (everything except the test files). List
-those folders to get the real names, and put them in place of `my_map.tif` and `my_plots.geojson`.
-Run the steps in order:
-```
-# 0. Which maps are stored (the user's real map is jambi-v1, in schema map_jambi_v1)
-python database/maps.py list
-# 1. Upload a map: both approaches, one transaction (already done for jambi-v1)
-python database/maps.py upload my_map.tif --name jambi-v1
-# 2. Check the farms: verdicts go to Neon (the map's plot_results) and to database/results/
-python database/polygon_approach.py check my_plots.geojson --map jambi-v1
-python database/stencil_approach.py check my_plots.geojson --map jambi-v1
-# 3. Prove nothing was lost: should say "0 differ". Downloads the whole map, so it's slow.
-python database/polygon_approach.py verify my_map.tif --map jambi-v1
-python database/stencil_approach.py verify my_map.tif --map jambi-v1
-# 4. The evaluation numbers: writes compare/results/comparison.csv
-python compare/compare.py my_map.tif my_plots.geojson --skip-verify --map jambi-v1
-```
-`--map` can be left out while only one map is stored.
-- After step 1, read the printed map size and colour mix. A big "no data" share means the TIFF
-  uses values other than 0–4. Crop a map much bigger than about 10,000 × 10,000 pixels first.
-- `--skip-verify` skips the pixel rebuild that step 3 already did. Leave it out to include pixel
-  fidelity in the `compare` output.
-
-### The test data (to check a change)
-Test data goes into a map of its own (`--name test`), so it never touches the user's maps:
-```
-python database/maps.py upload test_map.tif --name test
-python database/polygon_approach.py check test_plots.geojson --map test
-python database/stencil_approach.py check test_plots.geojson --map test
-python database/polygon_approach.py verify test_map.tif --map test
-python database/stencil_approach.py verify test_map.tif --map test
-python compare/compare.py test_map.tif test_plots.geojson --map test
-python compare/compare.py test_map.tif --point 103.6236 -1.7794 --point 103.3709 -1.6326 --map test   # forest, then land
-python database/maps.py delete test --yes                # clean up afterwards
-```
-IMPORTANT: the user's Neon database holds their real map, `jambi-v1` (schema `map_jambi_v1`).
-- `build --map X` replaces map X's tables, and `maps.py delete X` drops map X's schema for good.
-- Never build, upload over or delete `jambi-v1` (or another map you didn't create) without asking.
-- Run `python database/maps.py list` before writing anything.
-- Test maps get their own name and are deleted afterwards.
-`DATABASE_URL` is read from `.env` in the project root, unless it is already set in the
-environment (that wins).
-
-### Other commands and options
-| What | Command or option |
-|---|---|
-| Test single points (longitude first; repeat for more) | `python compare/compare.py my_map.tif --point 103.6236 -1.7794` |
-| Crop a big map by pixels | `python data/crop_tiff.py full_map.tif my_map.tif --size 5000` |
-| Crop starting at a pixel | `python data/crop_tiff.py full_map.tif my_map.tif --col 12000 --row 8000 --size 5000` |
-| Crop by coordinates (west, south, east, north) | `python data/crop_tiff.py full_map.tif my_map.tif --bounds 103.2 -1.9 103.7 -1.4` |
-| Treat points as circles of their declared area | `--point-mode circle` on `check` or `compare` |
-| Count only pixels whose centre is inside (stencils) | `--rule centre` on the stencil `check` or `compare` |
-| List / upload / rename / delete maps | `python database/maps.py list`, `upload TIF --name NAME`, `rename NAME NEW_NAME`, `delete NAME --yes` |
-| Which map (when several are stored) | `--map NAME` on `build`, `check`, `verify`, `compare` |
-| Move a one-map database into the new layout | `python database/maps.py migrate [--name NAME]` |
-| Where to write the CSV | `--csv FILE` on `check` or `compare` |
-| Timing runs per method / farms timed one at a time | `--repeat N` / `--single N` on `compare` |
-| Make new synthetic test data | `python data/make_test_data.py --help` |
-| Every option of a script | add `--help`, e.g. `python compare/compare.py --help` |
-| Lint (`pip install pyflakes` first) | `python -m pyflakes database compare data` |
-| Docker | `docker build -t eudr-storage .`, then `docker run --rm -v "$(pwd):/project" eudr-storage compare/compare.py my_map.tif my_plots.geojson` (PowerShell: `${PWD}`) |
-
-The example points are on the made-up test map. On the user's map, use points inside it;
-`compare` prints the map's extent when a point falls outside.
+`DATABASE_URL` is read from `backend/.env`, unless it is set in the environment.
 
 ## Checking a change
-Unit tests for the backend's map handling (names, schemas, `find_map`, `start_build`, `maps.py`,
-qualified tables) live in the frontend's suite (`../frontend/tests/test_map_names.py`,
-`test_approach_tables.py`, `test_maps.py`), using a fake connection. A change is done when:
-1. pyflakes is clean, and the frontend's unit tests pass.
-2. On the test data, `verify` reports 0 differing pixels for both approaches, and every
-   decision-fidelity row in `compare` is 100.00%.
-3. For changes to geometry, rules or speed, the same holds for a map in metres (the pixels of
-   `test_map.tif` saved with EPSG:32748 and 30 m pixels), for `--rule centre --point-mode circle`,
-   and for a map where forest is the most common colour (swap values 0 and 2).
+A change is done when:
+1. pyflakes is clean, the backend's unit tests pass, and so do the frontend's
+   (`frontend\.venv\Scripts\python -m unittest discover -s frontend/tests -t frontend`). The
+   frontend's tests check `common`, `maps` and both 5-colour approaches with its own fake
+   connection.
+2. `tests/smoke_pipeline.py` says "Everything matches". That means:
+   - decision fidelity is 100%, both for Neon vs `evidence.tif` and for `evidence.tif` vs the
+     original layers;
+   - 0 pixels differ for all three approaches.
+3. For geometry, rule or speed changes to the 5-colour approaches, it also holds for:
+   - a map in metres;
+   - `--rule centre --point-mode circle`;
+   - a map where forest is the most common colour.
 
 Show the commands and their output as evidence.
 
@@ -148,7 +137,7 @@ Show the commands and their output as evidence.
   - `public.maps` is the catalogue (name, schema, source file, fingerprint, size).
   - Every query names its tables with `grid.table("...")`, never through `search_path`. A `SET LOCAL` would cost a round trip per transaction, and it doesn't reach `VACUUM`.
   - `load_grid(conn, name)` and `find_map` choose the map.
-- **Uploads are atomic.** `maps.upload` builds both approaches in one transaction with `tidy=False`, then runs `VACUUM`. A failure or Ctrl+C leaves nothing behind.
+- **Uploads are atomic.** `maps.upload` builds every approach (stencils, outlines, and for a results folder the evidence pages) in one transaction with `tidy=False`, then runs `VACUUM`. A failure or Ctrl+C leaves nothing behind.
 - **PostGIS stays in `public`** (`CREATE EXTENSION ... SCHEMA public`), so dropping a map's schema can never remove it.
 - **A map's schema always follows its name.** `maps.rename` renames the schema (`ALTER SCHEMA ... RENAME`) and updates `grid_info.map_version`, `plot_results.map_version` and `public.maps`, in one transaction.
 - **`maps.delete` is guarded.** It needs the exact name, and drops only a schema that is listed in `public.maps` and matches `^map_[a-z0-9_]+$`.
@@ -163,6 +152,17 @@ Show the commands and their output as evidence.
 - Stencils: bit `r*8+c` of each square, little-endian `packbits`, 6 layers per page, zlib level 9.
   Pages that are all the default colour get no row. `STORAGE MAIN` and `VACUUM ANALYZE` after
   upload.
+- **Evidence pages:**
+  - Each page is zlib level 9 of: the count (`<u4`), then the palette (`<u4`), then the index
+    (`u1`, or `<u2` above 256 values).
+  - Pages that are all `evidence_info.default_value` get no row. That value is the most common
+    one; on a tie, the smallest.
+  - A check is 3 round trips: are the tables there?, `evidence_info`, the pages.
+- **`evidence_info`** keeps the bit layout and rule parameters. `check_layout` refuses evidence from
+  another version.
+- **`evidence_results`** has no `map_version` column, so a rename doesn't need to touch it.
+- **`grid_info.source_file`** is the uploaded file's path inside `layers/` (`common.stored_path`);
+  for a file outside `layers/`, just its name.
 
 ## Gotchas
 - Neon's pooled connection is PgBouncer in transaction mode: keep `prepare_threshold=None`, and
@@ -181,9 +181,9 @@ Show the commands and their output as evidence.
 `../frontend` (the PyQt app; see `../frontend/CLAUDE.md`) imports these modules through
 `frontend/backend.py`. If you rename or change any of the following, update the frontend in the
 same change, then run its tests (`frontend\.venv\Scripts\python -m unittest discover -s
-frontend/tests -t frontend`), `frontend\smoke_neon.py --map jambi-v1` and, for anything about
+frontend/tests -t frontend`), `frontend\smoke_neon.py --map Indonesia1` and, for anything about
 maps, `frontend\smoke_maps.py` (writes only a throwaway map).
-- `maps`: `list_maps`, `upload(conn, tif, name, report)`, `describe`, `rename(conn, name, new_name)` (returns `{old, name, schema}`), `delete`, `UPLOAD_STEPS`, `MAX_PIXELS`, `size_problem`, `MAP_TABLES`.
+- `maps`: `list_maps` (its output is unchanged unless `with_evidence=True`), `upload(conn, tif, name, report)` (a TIFF upload is unchanged: 7 steps), `describe`, `rename(conn, name, new_name)` (returns `{old, name, schema}`), `delete`, `UPLOAD_STEPS`, `MAX_PIXELS`, `size_problem`, `MAP_TABLES`.
 - `common`:
   - `connect`, `load_grid(conn, name)`, `find_map`, `table_exists`, `scan_map`, `save_results`, `check_with_tiff`, `area_m2`
   - `map_schema`, `MAP_NAME_MAX`, `default_map_name`, `normalise`, `Progress(total, label, report)`
@@ -199,7 +199,8 @@ maps, `frontend\smoke_maps.py` (writes only a throwaway map).
   - It must also work when given only points or only outlines.
 - Both approaches: `ensure_built(conn, grid)`, `build(conn, tif, map_name, report=None, tidy=True)` (returns the `Grid`), `verify(conn, grid, tif)`.
 - `stencil_approach`: `page_size`, `unzip_page`, `to_pixels`, `pack_page`, `LAYERS`. The frontend rebuilds the whole map from `SELECT page_col, page_row, stencils FROM {grid.table('stencil_pages')}`, and pages with no row are `default_class`.
-- `grid_info.source_file` names the uploaded TIFF. The frontend uses it to find the reference TIFF in `data/tiff/`.
+- `common.TIFF_DIR` (= `LAYERS_DIR`) plus `grid_info.source_file` is where the frontend looks for the reference TIFF.
+- The frontend's environment has no scipy or pandas. So `common`, `maps`, `stencil_approach` and `polygon_approach` must never import `layers`, `evidence_approach` or `eudr_layers` at module level. `maps.upload` imports them only for a results folder.
 
 ## Style
 - Plain English for a student audience, British/Singapore spelling (colour, metres). Error
@@ -211,5 +212,6 @@ maps, `frontend\smoke_maps.py` (writes only a throwaway map).
 
 ## Privacy
 - Never commit or print `.env` (it holds the Neon password), or copy it into the Docker image.
-- Real TIFFs and GeoJSONs are customer data and stay out of Git. Only `test_map.tif` and
-  `test_plots.geojson` are tracked.
+- Satellite layers, `layers/`, TIFFs and GeoJSONs are customer data and stay out of Git.
+  `.gitignore` ignores all `*.tif`, `*.tiff` and `*.geojson`. Tests make made-up data in temporary
+  folders.

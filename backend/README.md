@@ -1,245 +1,239 @@
-# EUDR map storage: outlines vs stencils
+# EUDR layers: from satellite data to a queryable map in Neon
 
-Two ways to store a 5-colour EUDR map (land, water, forest, deforestation, needs review)
-in a **Neon** PostgreSQL database, and check farms against it:
+One backend, two steps:
 
-- **Outlines** (`database/polygon_approach.py`) – your team's vector idea. Uses PostGIS, which is switched on automatically.
-- **Stencils** (`database/stencil_approach.py`) – Matthew's 8 × 8 bitmap idea. Uses plain PostgreSQL.
+1. **Compaction** (`compaction/eudr_layers.py`, Joe's code). About 20 satellite layers become **one
+   32-bit number per pixel**, `evidence.tif`. The layers include JRC forest 2020, Hansen tree loss,
+   JRC TMF yearly change 2020–2025, RADD radar alerts, optical alerts and the rubber map.
+   - **What each number holds:** every fact the EUDR decision needs. That means forest on 31 Dec
+     2020, forest type, the year each source records a clearing, alerts, rubber and water.
+   - **Time:** kept as events (the first clearing year per source), not one map per year.
+   - **The rule:** the EUDR rule turns the evidence into `outcome.tif`.
+   - **The proof:** Joe's `--verify` shows the compact layers give every test plot exactly the
+     answers the original layers give.
+2. **Storage and queries in Neon** (`database/`). The compact layers go into a Neon PostgreSQL
+   database, three ways:
+   - **Evidence pages** (`database/evidence_approach.py`). This stores `evidence.tif` itself, in
+     zipped 256 × 256 pages. A check runs Joe's own rule on the pages under each plot. So every plot
+     gets exactly what `eudr_layers.py` gives it:
+     - the verdict and the reason;
+     - the hectares of 2020 forest and of each kind of clearing;
+     - the years.
+   - **Stencils** (`database/stencil_approach.py`, Matthew's 8 × 8 bitmap idea) and **outlines**
+     (`database/polygon_approach.py`, PostGIS shapes). These store the outcome in 5 colours: land,
+     water, forest, deforestation and needs review. They answer the fast "is it in forest?"
+     questions, and the app uses them.
 
-**Nothing is lost.** Both store every colour, including land and forest, and `verify` proves
-it by rebuilding the whole map from the database and matching your TIFF pixel for pixel.
-
-For every farm, both answer:
-- **Is the point in forest? Does the outline overlap forest?** And by how many hectares.
-- **Every colour the farm touches**, with hectares of each.
-- **The EUDR verdict:** `FAIL`, `MANUAL_REVIEW`, `CANNOT_CHECK`, `CHECK_LOCATION` or `PASS`.
+`pipeline.py` runs everything in one command. **Nothing is lost:** each approach's `verify`
+rebuilds the whole map from Neon and matches the file bit for bit.
 
 ---
 
 ## Folder structure
 
 ```
-eudr_storage/                    <- the project folder: run every command from here
-├── .env                         <- YOU CREATE THIS: your Neon connection string
-├── .env.example                 <- copy this to make .env
-├── README.md
-├── CLAUDE.md                    <- notes for Claude Code (read automatically)
+backend/                         <- run every command from here
+├── .env                         <- YOU CREATE THIS: your Neon connection string (never in Git)
+├── pipeline.py                  <- the whole chain: compaction -> upload -> check
 ├── requirements.txt
 ├── Dockerfile
-│
-├── data/
-│   ├── tiff/                    <- PUT YOUR TIFF FILES HERE
-│   │   └── test_map.tif             (made-up Jambi map, included)
-│   ├── geojson/                 <- PUT YOUR FARM GEOJSON FILES HERE
-│   │   └── test_plots.geojson       (303 made-up farms, included)
-│   ├── crop_tiff.py             <- optional: cut a smaller piece out of a big TIFF
-│   └── make_test_data.py        <- optional: makes the test map and farms
-│
-├── database/                    <- everything that talks to Neon
-│   ├── test_connection.py       <- step 1: check Neon is reachable
-│   ├── maps.py                  <- several maps: list / upload (both approaches) / rename / delete / migrate
-│   ├── polygon_approach.py      <- outlines: build / check / verify
+├── compaction/                  <- step 1
+│   ├── eudr_layers.py           <- Joe's code: satellite layers -> evidence.tif, outcome.tif, ...
+│   └── make_test_layers.py      <- made-up satellite layers, to try everything without real data
+├── database/                    <- step 2: everything that talks to Neon
+│   ├── test_connection.py       <- check Neon is reachable
+│   ├── maps.py                  <- several maps: list / upload / rename / delete / migrate
+│   ├── layers.py                <- reads a results folder for the database (5 colours, the rule)
+│   ├── evidence_approach.py     <- evidence pages: build / check / verify
 │   ├── stencil_approach.py      <- stencils: build / check / verify
+│   ├── polygon_approach.py      <- outlines: build / check / verify
 │   ├── common.py                <- shared rules (used by the others, don't run it)
 │   └── results/                 <- verdict CSVs (created automatically)
-│
-└── compare/                     <- the evaluation
-    ├── compare.py               <- both approaches vs the original TIFF
-    └── results/                 <- comparison.csv (created automatically)
+├── compare/
+│   ├── compare.py               <- the evaluation: Neon vs the files vs the original layers
+│   └── results/                 <- comparison CSVs (created automatically)
+├── tests/                       <- unit tests, and smoke_pipeline.py (a live run on a throwaway map)
+└── layers/<map>/                <- what step 1 builds, one folder per map (created; never in Git)
 ```
 
-**Give just file names.** The scripts look in `data/tiff/` for TIFFs and in `data/geojson/`
-for GeoJSONs, so `my_map.tif` is enough. Full paths work too.
+There is no `data/` folder any more:
+- Your satellite layers stay wherever they are; you give their folder with `--data-dir`.
+- The compact layers go to `layers/<map>/`.
+- A file can be given by its full path or its path inside `layers/`, e.g. `jambi/test_plots.geojson`.
 
 ---
 
 ## How each approach stores the map
 
-**Shared trick: leave out the most common colour.** The build counts every colour first. The
-most common one (usually land) is never stored: *anything not in the database is that colour*.
-This saves the most space and loses nothing.
+| | Evidence pages | Stencils | Outlines |
+|---|---|---|---|
+| Stores | `evidence.tif`: all 17 facts per pixel, 32 bits | the 5 colours | the 5 colours |
+| Idea | Each 256 × 256 page holds its distinct values (about 25), plus one byte per pixel pointing to one; zipped | Per colour, each 8 × 8 square of yes/no pixels becomes one 64-bit number; each page is zipped | Each patch of colour is traced into a shape that follows the pixel edges (64 × 64 tiles), plus square labels |
+| Left out | Pages that are all the most common value | The most common colour | The most common colour |
+| Tables | `evidence_pages`, `evidence_info` (bit layout, rule settings) | `stencil_pages` | `class_polys` (spatial index), `square_labels` |
+| A check | One query fetches the pages under all the plots; Joe's rule runs on them | One query fetches the pages; pixels are counted | PostGIS measures exact overlaps |
+| Answers | Joe's verdict and reason, hectares of each kind of clearing, the years | Colours touched, hectares, verdict | Colours touched, exact hectares, verdict |
+| Plot rule | Pixels whose centre is inside (Joe's rule) | Pixels the plot overlaps (or `--rule centre`) | Exact areas |
 
-| | Outlines | Stencils |
-|---|---|---|
-| Idea | Trace each patch of colour into a shape that follows the pixel edges | Per colour, pack each 8 × 8 square of yes/no pixels into one 64-bit number |
-| Efficiency trick | Traced in small 64 × 64-pixel tiles, so shapes have few corners and overlap checks stay fast. Plus **square labels**: each 16 × 16-pixel square is marked "all one colour (which)" or "mixed" | A page's numbers are mostly 0 or all-ones, so each 256 × 256 page is zipped into one row (Matthew's "then compress it") |
-| Tables | `class_polys`: colour + shape, with a spatial index. `square_labels`: one zipped row of labels per page | `stencil_pages`: one zipped row per page |
-| Checking a point | Which shape holds the point? | Test one bit per colour |
-| Checking an outline | Exact overlap area with each nearby shape | AND the farm's stencil with each colour's stencil, count the 1s |
-| Shortcut | In a batch of 200+ farms, a farm sitting entirely in one-colour squares is answered from the labels, with no geometry | – |
-| Hectares measured as | Exact area | Whole pixels (bigger for small farms) |
-
-After uploading, the stencil table is packed tightly (`VACUUM`) and keeps its zipped pages
-inside the table rows (`STORAGE MAIN`). Together these made it 20% smaller in tests: 1.20 MB
-down to 0.96 MB on the large map.
+**Why not outlines for the evidence?**
+- A 32-bit value has thousands of possible combinations, so it would trace into far more shapes
+  than 5 colours do.
+- A page of evidence holds only about 25 distinct values, so the palette pages are small. On a map
+  made from Jambi's real outcome, they were half the size of `evidence.tif`.
+- They also decode in about 0.5 ms a page.
 
 ---
 
 ## Step 0: One-time setup
 
 1. Install **Python 3.10 or newer**.
-2. Unzip the project, open a terminal and go into the folder: `cd path/to/eudr_storage`
-3. Recommended: create a virtual environment so the packages stay separate.
-   - Windows: `python -m venv .venv`, then `.venv\Scripts\activate`
-   - macOS / Linux: `python3 -m venv .venv`, then `source .venv/bin/activate`
+2. Open a terminal in the `backend` folder.
+3. Create a virtual environment and activate it:
+   - Windows: `python -m venv venv`, then `venv\Scripts\activate`
+   - macOS / Linux: `python3 -m venv venv`, then `source venv/bin/activate`
 4. Install the packages: `pip install -r requirements.txt`
 
 ## Step 1: Connect to Neon (`.env`)
 
-1. Go to [console.neon.tech](https://console.neon.tech) and create a project.
-   Choose the **AWS Asia Pacific (Singapore)** region: it's closest to you, so uploads and queries are faster.
-2. On the project dashboard, click **Connect** and copy the connection string.
-3. Create `.env` in the **project folder** (next to `README.md`, not inside `database/`):
-   - Windows: `copy .env.example .env`, then `notepad .env`
-   - macOS / Linux: `cp .env.example .env`, then open it in any editor
-4. Replace the example line with your string, on **one line** and **without quotes**:
+1. Go to [console.neon.tech](https://console.neon.tech) and create a project in the **AWS Asia
+   Pacific (Singapore)** region.
+2. Click **Connect** and copy the connection string.
+3. Create `.env` in the **backend folder**, with this one line and no quotes (use your own string):
    ```
    DATABASE_URL=postgresql://neondb_owner:abc123@ep-cool-name-123456.ap-southeast-1.aws.neon.tech/neondb?sslmode=require
    ```
-5. Test it:
-   ```
-   python database/test_connection.py
-   ```
-   You should see `All good`.
+4. Test it: `python database/test_connection.py` should say `All good`.
 
-## Step 2: Put your files in `data/`
-
-- Your **TIFF** goes in `data/tiff/`, e.g. `data/tiff/my_map.tif`. It needs:
-  - one band of whole numbers: **0 land, 1 water, 2 forest, 3 deforestation, 4 needs review**
-    (any other value counts as "no data", and farms on it get `CANNOT_CHECK`)
-  - a coordinate system: degrees (EPSG:4326) or metres (e.g. UTM 48S, EPSG:32748)
-  - "no data" marked with a value outside 0–4, such as 255, because 0 means land
-- Your **farms** go in `data/geojson/`, e.g. `data/geojson/my_plots.geojson`.
-  They can be `Point` and `Polygon` features in normal longitude/latitude. The `plot_id` and
-  `area_ha` properties are used if present.
-- **Big map? Crop it first.** Neon's free plan has limited storage:
-  ```
-  python data/crop_tiff.py full_map.tif my_map.tif --size 5000
-  ```
-
-## Step 3: Upload the map to Neon (`maps.py upload`)
+## Step 2: Build, upload and check a map (`pipeline.py`)
 
 ```
-python database/maps.py upload my_map.tif --name jambi-v1
+python pipeline.py --name jambi --data-dir D:\eudr\inputs --bbox 103.0 -2.3 103.5 -1.8 --test-plots 1000 --verify
 ```
 
-This builds **both approaches** (stencils and outlines) in one transaction. If anything fails, or
-you press Ctrl+C, nothing is left behind. It prints the colour mix, which colour was left out, and
-the size of every table. Without `--name`, the map is named after the file (`my_map`).
+1. **Compaction.** `eudr_layers.py` reads the satellite layers in `--data-dir` for the box. It
+   finds them by their file names (see the top of `compaction/eudr_layers.py`). It writes
+   `layers/jambi/`:
+   - `evidence.tif`, `outcome.tif` and `outcome_simple.tif`;
+   - 1,000 test plots;
+   - with `--verify`, the check against the original layers (`fidelity_plots.csv`, `summary.json`).
+2. **Upload.** The folder goes to Neon as the map `jambi`, with the evidence pages, the stencils
+   and the outlines, in one transaction. If anything fails, or you press Ctrl+C, nothing is left
+   behind.
+3. **Check.** The test plots (and `--plots FILE`) are checked against Neon, and the verdicts are
+   saved there. Every answer is compared with `eudr_layers.py`'s own answer from `evidence.tif`.
 
-To rebuild just one approach of a map that is already stored:
+Options:
+- Every option the script doesn't know goes to `eudr_layers.py`: `--plots`, `--grid 30m`,
+  `--protected FILE`, and so on (see `python compaction/eudr_layers.py --help`).
+- `--skip-build` uploads a folder that is already built.
+- `--no-upload` stops after step 1.
+- To run step 1 without a database:
+  `python compaction/eudr_layers.py --data-dir ... --bbox ... --out-dir layers/jambi`
 
-```
-python database/stencil_approach.py build my_map.tif --map jambi-v1
-python database/polygon_approach.py build my_map.tif --map jambi-v1
-```
-
-If you rebuild a map from a *different* TIFF with one approach, that map's other approach is
-removed, so a map never mixes two TIFFs. Just run its build too.
-
-## Several maps
-
-Neon can hold several maps, for example different areas. Each map lives in its own **schema**
-(a folder of tables) named after it: `jambi-v1` is stored in `map_jambi_v1`, with its own
-`grid_info`, `stencil_pages`, `class_polys`, `square_labels`, `plots` and `plot_results`.
-The table `public.maps` lists them all.
-
-```
-python database/maps.py list                       # every map: schema, size, TIFF, approaches built
-python database/maps.py upload riau.tif --name riau
-python database/maps.py rename riau "Riau 2024"     # a new name (its schema is renamed too)
-python database/maps.py delete riau --yes          # drops the map's schema: can't be undone
-```
-
-- With more than one map stored, tell `check`, `verify` and `compare` which one to use with
-  `--map NAME`. With only one map, they use it.
-- Names are 1–40 characters, with at least one letter or digit. Two names that would share a
-  schema (`Jambi V1` and `jambi-v1`) aren't allowed, and nor is uploading the same TIFF twice.
-- The app (`../frontend`) has the same upload, switch and delete in its **Maps** menu.
-- A database set up before several maps were supported keeps its one map in the `public`
-  schema. Move it once with `python database/maps.py migrate`. It takes a second, and nothing is
-  re-uploaded.
-
-## Step 4: Upload farms and get answers (`check`)
+**Try it without real data.** Make up some satellite layers, then run the pipeline on them:
 
 ```
-python database/polygon_approach.py check my_plots.geojson
-python database/stencil_approach.py check my_plots.geojson
-```
-
-- The farms are saved in the `plots` table, exactly as in the GeoJSON.
-- Every answer is saved in `plot_results`, one row per farm per method: the verdict, the
-  colours touched, the colour under a point, and hectares of forest, land, deforestation,
-  needs review, water and no data.
-- A copy goes to `database/results/results_polygons.csv` and `database/results/results_stencils.csv`.
-
-## Step 5: Prove nothing was lost, and compare (`verify`, `compare`)
-
-```
-python database/polygon_approach.py verify my_map.tif
-python database/stencil_approach.py verify my_map.tif
-python compare/compare.py my_map.tif my_plots.geojson
-```
-
-- `verify` rebuilds the whole map from Neon and compares every pixel with your TIFF.
-- `compare` checks every farm with the original TIFF, the stencils and the outlines, and
-  reports the two questions **separately**:
-  - **Question 1, "Is the point in forest?"** – every point farm in the GeoJSON
-  - **Question 2, "Does the outline overlap forest?"** – every outline farm in the GeoJSON
-
-  For each question it shows decision fidelity (in forest? / overlaps forest?, every colour
-  touched, the EUDR verdict) and speed: all farms at once, per farm, and one farm on its own.
-  Then come pixel fidelity and storage for the whole map. The per-farm table is written to
-  `compare/results/comparison.csv`.
-
-**Test single points.** Add `--point LONGITUDE LATITUDE`, as many times as you like. Each point
-gets every method's answer and time. Test points aren't saved to the database. The GeoJSON is
-optional when you use `--point`:
-
-```
-python compare/compare.py my_map.tif --point 103.6236 -1.7794
-python compare/compare.py my_map.tif my_plots.geojson --point 103.6236 -1.7794 --point 103.3709 -1.6326
-```
-
-To test a single outline, put it in a GeoJSON file (a FeatureCollection, one Feature, or just the
-Polygon itself) in `data/geojson/`.
-
-## Step 6: Look at the data in Neon
-
-In the Neon console, open **Tables** to browse (pick the map's schema, e.g. `map_jambi_v1`), or
-the **SQL Editor** to run queries such as:
-
-```sql
-SELECT * FROM public.maps;                                              -- the maps stored
-SELECT * FROM map_jambi_v1.grid_info;                     -- default_class = the colour left out
-SELECT plot_id, method, verdict, colours, point_colour, forest_ha
-FROM map_jambi_v1.plot_results ORDER BY plot_id, method;
-SELECT * FROM map_jambi_v1.plot_results WHERE colours LIKE '%forest%';  -- in or overlapping forest
-SELECT class_id, count(*) FROM map_jambi_v1.class_polys GROUP BY class_id;
-SELECT pg_size_pretty(pg_total_relation_size('map_jambi_v1.stencil_pages'));
-```
-
-## Try it first with the test data
-
-The included made-up files work with exactly the same steps. Upload them as a map of their own,
-so they never touch your real map:
-
-```
-python database/test_connection.py
-python database/maps.py upload test_map.tif --name test
-python database/polygon_approach.py check test_plots.geojson --map test
-python database/stencil_approach.py check test_plots.geojson --map test
-python compare/compare.py test_map.tif test_plots.geojson --map test
-python compare/compare.py test_map.tif --point 103.6236 -1.7794 --point 103.3709 -1.6326 --map test
+python compaction/make_test_layers.py C:\temp\test_layers        # prints the --bbox to use
+python pipeline.py --name test --data-dir C:\temp\test_layers --bbox <the printed box> --test-plots 300 --verify
+python compare/compare.py test --map test
 python database/maps.py delete test --yes
 ```
 
-The first test point is in forest and the second is on land. (`maps.py upload` refuses a TIFF
-that is already stored under another name.)
+## Step 3: Check more plots (`check`)
+
+```
+python database/evidence_approach.py check farms.geojson --map jambi    # Joe's verdict, reason, hectares, years
+python database/stencil_approach.py check farms.geojson --map jambi     # the 5 colours
+python database/polygon_approach.py check farms.geojson --map jambi
+```
+
+- **Plot formats.** Plots can be in the EU Information System format (`ProductionPlace`, `Area`),
+  or have `plot_id` and `area_ha`.
+- **Points.** The evidence check treats a point as a circle of its declared area (4 ha if none is
+  given), as the EU system does. The stencils and outlines check the pixel under it.
+- **Where results go:**
+  - the plots go to the map's `plots` table;
+  - evidence verdicts go to `evidence_results` (verdict, reason, every figure as JSON);
+  - 5-colour verdicts go to `plot_results`;
+  - CSV copies go to `database/results/`.
+
+## Step 4: Prove nothing was lost, and compare (`verify`, `compare`)
+
+```
+python database/evidence_approach.py verify jambi --map jambi                # all 32 bits, every pixel
+python database/stencil_approach.py verify jambi/outcome_5class.tif --map jambi
+python database/polygon_approach.py verify jambi/outcome_5class.tif --map jambi
+python compare/compare.py jambi --map jambi
+```
+
+`compare.py` with a results folder reports:
+- **Part 1, the 5 colours.** Stencils and outlines vs the TIFF, with decision fidelity and speed.
+  "Is the point in forest?" and "does the outline overlap forest?" are reported separately.
+- **Part 2, the evidence:**
+  - decision fidelity of Neon vs `evidence.tif` (every output of every plot);
+  - decision fidelity of `evidence.tif` vs the original layers (from `--verify`);
+  - speed of Neon, of `evidence.tif` on disk and of the original layers;
+  - pixel fidelity of the evidence pages, and what `evidence.tif` keeps of each original layer.
+- **Storage.** Sizes from the original layers, through `evidence.tif`, to each approach in Neon.
+
+Other uses:
+- `--point LON LAT` tests single points against the 5 colours.
+- For a map uploaded from a 5-colour TIFF (e.g. by the app), run
+  `python compare/compare.py my_map.tif farms.geojson --map NAME`.
+
+## Several maps
+
+Each map lives in its own **schema** named after it (`jambi` -> `map_jambi`), listed in
+`public.maps`:
+
+```
+python database/maps.py list                            # every map: schema, size, source, approaches
+python database/maps.py upload layers/riau --name riau  # a results folder: all three approaches
+python database/maps.py upload riau.tif --name riau     # a 5-colour TIFF: stencils and outlines only
+python database/maps.py rename riau "Riau 2024"         # its schema is renamed too
+python database/maps.py delete riau --yes               # drops the map's schema: can't be undone
+```
+
+- With more than one map stored, give `--map NAME` to `check`, `verify` and `compare`.
+- The app (`../frontend`) uploads 5-colour TIFFs, and switches, renames and deletes maps.
+- A database set up before several maps were supported is moved once with `maps.py migrate`.
+
+## Look at the data in Neon
+
+```sql
+SELECT * FROM public.maps;
+SELECT bit_layout, rule_params, default_value FROM map_jambi.evidence_info;
+SELECT plot_id, verdict, reason, facts->>'confirmed_ha', facts->>'first_deforestation_year'
+FROM map_jambi.evidence_results ORDER BY verdict;
+SELECT pg_size_pretty(pg_total_relation_size('map_jambi.evidence_pages'));
+```
 
 ---
 
-## How a farm is checked
+## The live test (`tests/smoke_pipeline.py`)
+
+This test runs the whole chain on a made-up 600 × 600 map with 300 test plots, over Neon, on
+16 Oct 2026:
+
+- **Decision fidelity:**
+  - Neon vs `evidence.tif`: 300 of 300 plots were identical in all 35 outputs.
+  - `evidence.tif` vs the original layers: 300 of 300 were identical.
+- **Pixel fidelity:** the evidence pages, the stencils and the outlines each rebuilt 360,000 pixels
+  with 0 differences.
+- **Speed** (one run, not a median):
+
+  | | 300 plots at once | One plot alone |
+  |---|---|---|
+  | Neon evidence pages | 0.47 s | 24 ms |
+  | `evidence.tif` on disk | 0.38 s | 10 ms |
+  | Original layers (14 files) | – | 5.3 ms a plot, read locally |
+
+On so small a map, Neon's table sizes are mostly PostgreSQL's minimum page sizes, so they say
+nothing about storage. For storage, use `compare.py` on a real results folder.
+
+---
+
+## How a farm is checked (stencils and outlines)
 
 1. **Outside the map?** → `CANNOT_CHECK`.
 2. **Detailed check:** all farms are answered together, not one query per farm.
@@ -265,7 +259,10 @@ It is reported separately: `touches_forest`, `forest_ha` and `point_colour`.
 
 | Option | Command | Meaning |
 |---|---|---|
-| `--name NAME` | `maps.py upload` | The new map's name (default: the TIFF's file name) |
+| `--name NAME` | `pipeline.py`, `maps.py upload` | The map's name in Neon (`maps.py`'s default: the folder's or TIFF's name). `pipeline.py` also uses it for the folder `layers/<name>` |
+| `--skip-build` / `--no-upload` | `pipeline.py` | Upload a folder that is already built / stop after building it |
+| `--min-plot-ha HA` | evidence `check`, `compare`, `pipeline.py` | Ignore clearing of at most this many hectares per plot, as `eudr_layers.py` does (default 0: the EUDR has no tolerance) |
+| `--csv-evidence FILE` | `compare` | Where to write part 2's per-plot table |
 | `--map NAME` | `build`, `check`, `verify`, `compare` | Which map: the one to build, or the one to check against when several are stored |
 | `--rule touched` / `centre` | stencil `check`, `compare` | Which pixels count as inside an outline: every pixel it overlaps (cautious, default) or only pixels whose centre is inside |
 | `--point-mode pixel` / `circle` | `check`, `compare` | A point is checked against the pixel under it (default), or turned into a circle with its declared area |
@@ -281,13 +278,17 @@ Every script explains itself with `--help`, e.g. `python database/stencil_approa
 
 | Message | Fix |
 |---|---|
-| `DATABASE_URL is not set` | `.env` is missing or not in the project folder. It must sit next to `README.md`. |
+| `DATABASE_URL is not set` | `.env` is missing or not in the backend folder. It must sit next to `README.md`. |
 | `Note: using .env.txt` | Windows Notepad added `.txt`. It still works, but turn on "File name extensions" in File Explorer and rename it to `.env`. |
 | `Your .env still has the example connection string` | Paste your own string from Neon's **Connect** button. |
 | `Could not connect to the database` | Copy the string again from Neon. Keep `?sslmode=require` and check you're online. |
-| `Can't find the TIFF file` / `GeoJSON file` | Put the file in `data/tiff/` or `data/geojson/` and check the spelling, including `.tif` vs `.tiff`. |
+| `Can't find the TIFF file` / `GeoJSON file` | Give its full path, or its path inside `layers/` (e.g. `jambi/test_plots.geojson`). Check `.tif` vs `.tiff`. |
 | `PostGIS could not be switched on` | The outlines approach needs PostGIS. The stencils approach still works. |
-| `No map in the database yet` | Upload one first (Step 3). |
+| `No map in the database yet` | Build and upload one first (Step 2). |
+| `... isn't a results folder of the compaction step` | The folder has no `evidence.tif` and `outcome.tif`. Build it with `pipeline.py` (or `eudr_layers.py --out-dir`). |
+| `... has no evidence pages` | The map was uploaded from a 5-colour TIFF. Upload its results folder as a map to use the evidence. |
+| `... written by another version of eudr_layers.py (bit layout ...)` | The results folder was built by a different version of Joe's code. Rebuild it with `compaction/eudr_layers.py`, or put that version there. |
+| `Missing required input(s): gfc2020` / `No JRC GFC2020 file covers the box` | `--data-dir` needs the satellite layers for the box, named as `eudr_layers.py` expects (see the top of that file). |
 | `Your map is stored the old way` | Run `python database/maps.py migrate` once. It moves the map into its own schema without re-uploading. |
 | `Several maps are stored (...)` | Add `--map NAME`. `python database/maps.py list` shows the names. |
 | `There's no map called '...'` | Check the spelling against `python database/maps.py list`. |
@@ -306,29 +307,29 @@ Every script explains itself with `--help`, e.g. `python database/stencil_approa
 
 ## Running in Docker (optional)
 
-The database stays on Neon; the container just runs the scripts. From the project folder:
+The database stays on Neon; the container just runs the scripts. From the backend folder:
 
 ```
 docker build -t eudr-storage .
 docker run --rm -v "$(pwd):/project" eudr-storage database/test_connection.py
-docker run --rm -v "$(pwd):/project" eudr-storage database/maps.py upload my_map.tif --name jambi-v1
-docker run --rm -v "$(pwd):/project" eudr-storage compare/compare.py my_map.tif my_plots.geojson
+docker run --rm -v "$(pwd):/project" -v "D:/eudr/inputs:/inputs" eudr-storage pipeline.py --name jambi --data-dir /inputs --bbox 103.0 -2.3 103.5 -1.8
+docker run --rm -v "$(pwd):/project" eudr-storage compare/compare.py jambi --map jambi
 ```
 
-`-v` shares the project folder with the container, so it reads your `.env` and `data/`, and
-writes the `results/` folders back to your computer. Your `.env` is never copied into the image.
-On Windows PowerShell, replace `$(pwd)` with `${PWD}`.
+The first `-v` shares the backend folder, so the container reads your `.env` and writes `layers/` and the
+`results/` folders back to your computer; the second shares your satellite layers. Your `.env` is never
+copied into the image. On Windows PowerShell, replace `$(pwd)` with `${PWD}`.
 
 ## Keeping things private
 
-`.gitignore` keeps `.env` (your database password), your own TIFFs and GeoJSONs (customer data)
-and the results out of Git. Only the small made-up test files are kept.
+`.gitignore` keeps `.env` (your database password), `layers/`, every TIFF and GeoJSON (customer data) and
+the results out of Git. Tests make their own made-up data in temporary folders.
 
 ---
 
-## Results on the test data
+## Earlier results: the 5 colours on a local database
 
-Measured with `compare.py` on made-up Jambi maps (land 61%, forest 32%, water 3%,
+Measured before the merge with Joe's code, with `compare.py` on made-up 5-colour Jambi maps (land 61%, forest 32%, water 3%,
 deforestation 2%, needs review 2%), using a local PostgreSQL 16 + PostGIS 3.4 database.
 Times vary by about ±20% between runs.
 
