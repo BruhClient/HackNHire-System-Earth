@@ -15,7 +15,7 @@ From the project folder (`HackNHire\`):
 frontend\.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-The app connects with `DATABASE_URL` from the project's `.env`, the same as the backend.
+The app connects with `DATABASE_URL` from `backend\.env`, the same file as the backend (copy `backend\.env.example`; see the main [README](../README.md#step-3-put-the-connection-string-in-backendenv)). To point the app at a different database, copy `frontend\.env.example` to `frontend\.env` instead: it wins over `backend\.env` for the app only. A `DATABASE_URL` set in the terminal wins over both.
 
 ## Run
 

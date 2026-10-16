@@ -96,7 +96,7 @@ From `frontend\`:
 - `--benchmark` opens Compare and runs the benchmark.
 - `--screenshot PATH --after SECONDS` saves `window.grab()`, then quits. Use it to look at the UI. `grabWindow` returns black for the web view, so don't use that.
 
-`DATABASE_URL` comes from `../backend/.env` (`common.connect()`), unless it is already set in the environment.
+`DATABASE_URL` comes from the environment, else `frontend/.env` (optional, read by `backend.py` at import with `common._read_env_file`; see `.env.example`), else `../backend/.env` (`common.connect()`).
 
 ## Checking a change
 

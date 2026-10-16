@@ -2,6 +2,8 @@
 .env
 .env.*
 *.env
+# ...except the example, which holds no password (copy it to backend/.env)
+!.env.example
 
 # Local environments and caches
 venv/
