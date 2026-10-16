@@ -23,7 +23,7 @@ import psycopg
 import rasterio
 from pyproj import Transformer
 
-from backend import common, maps, polygon_approach, stencil_approach
+from backend import common, maps, polygon_approach, protected_areas, stencil_approach
 import farmgen
 import metering
 from farms import farm_area_ha, features_from_file, prepare_farms
@@ -123,6 +123,7 @@ class NeonService:
         self.on_status = on_status or (lambda text: None)
         self.conn = None
         self.grid = self.classes = self.counts = None
+        self.protected = None                   # the map's protected areas (GeoJSON, lon/lat) or None
         self.source_file = None
         self.tif_path = None
         self.tif_note = "The TIFF hasn't been looked for yet."
@@ -204,7 +205,8 @@ class NeonService:
 
     # ----- the map shown -----
     def open_map(self, name=None):
-        """The map's grid_info, then every stencil page in one query, unpacked into self.classes.
+        """The map's grid_info, then every stencil page in one query, unpacked into self.classes,
+        and its protected areas, if it has any (one more query), into self.protected.
         name: which stored map (None: the only one). Returns what the map page needs (JSON-ready)."""
         def load(conn):
             grid = common.load_grid(conn, name)
@@ -214,10 +216,10 @@ class NeonService:
                 source_file = cur.fetchone()[0]
                 cur.execute(f"SELECT page_col, page_row, colours FROM {grid.table('stencil_pages')}")
                 rows = cur.fetchall()
-            return grid, source_file, rows
+            return grid, source_file, rows, protected_areas.load(conn, grid)
 
         self.on_status(f"Reading the map '{name}' from Neon…" if name else "Reading the map from Neon…")
-        grid, self.source_file, rows = self._run(load)
+        grid, self.source_file, rows, self.protected = self._run(load)
         self.grid = grid
         self.to_map, self.to_lonlat = lonlat_transformers(grid)
         self.classes = classes_from_pages(grid, rows)
@@ -262,6 +264,7 @@ class NeonService:
                          "pixels": int(counts[c]), "share": 100.0 * int(counts[c]) / total}
                         for c in CLASSES if counts[c]],
             "tiff": {"available": self.tif_path is not None, "note": self.tif_note},
+            "protected_areas": len(self.protected["features"]) if self.protected else 0,
         }
 
     # ----- checking farms -----

@@ -27,6 +27,7 @@ function setMapInfo(info) {
 function clearMapInfo() {
   if (eudr.layer) map.removeLayer(eudr.layer);
   eudr.layer = null;
+  setProtectedAreas(null);
 }
 
 function setHiddenClasses(codes) {
@@ -38,4 +39,40 @@ function setOverlayVisible(on) {
   eudr.visible = on;
   if (!eudr.layer) return;
   if (on) eudr.layer.addTo(map); else map.removeLayer(eudr.layer);
+}
+
+// Protected areas (WDPA polygons stored with the map, protected_areas.py): a dashed outline in
+// their own pane, above the EUDR tiles and below the farms, with the area's name on hover.
+map.createPane('protected').style.zIndex = 350;
+var protectedAreas = { layer: null, visible: true };
+
+function protectedTooltip(p) {
+  var lines = ['<b>' + esc(p.name || 'Protected area') + '</b>'];
+  if (p.designation) lines.push(esc(p.designation));
+  if (p.iucn_cat) lines.push('IUCN category ' + esc(p.iucn_cat));
+  if (p.wdpa_id) lines.push('WDPA ' + esc(p.wdpa_id));
+  return lines.join('<br>');
+}
+
+function setProtectedAreas(fc) {
+  if (protectedAreas.layer) map.removeLayer(protectedAreas.layer);
+  protectedAreas.layer = null;
+  if (!fc || !fc.features || !fc.features.length) return;
+  var colour = CONFIG.protected.colour;
+  protectedAreas.layer = L.geoJSON(fc, {
+    pane: 'protected',
+    style: function () {
+      return { color: colour, weight: 2, opacity: 0.95, dashArray: '6 4', fillColor: colour, fillOpacity: 0.12 };
+    },
+    onEachFeature: function (feature, layer) {
+      layer.bindTooltip(protectedTooltip(feature.properties || {}), { sticky: true });
+    }
+  });
+  if (protectedAreas.visible) protectedAreas.layer.addTo(map);
+}
+
+function setProtectedVisible(on) {
+  protectedAreas.visible = on;
+  if (!protectedAreas.layer) return;
+  if (on) protectedAreas.layer.addTo(map); else map.removeLayer(protectedAreas.layer);
 }

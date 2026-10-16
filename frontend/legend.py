@@ -24,6 +24,9 @@ CHART_ORDER = (DEFORESTATION, REVIEW, FOREST, WATER, NO_DATA, LAND)
 
 PROBLEM_CLASSES = (DEFORESTATION, REVIEW, WATER, NO_DATA)  # highlighted in the focus view
 
+PROTECTED_LABEL = "Protected areas"  # the WDPA polygons stored with a map (protected_areas.py)
+PROTECTED_COLOUR = "#FFD000"         # yellow, dashed on the map: unlike every class and farm colour
+
 METHODS = {  # key -> (label, chart colour)
     "stencils": ("Stencils", "#eb6834"),
     "polygons": ("Outlines", "#1baf7a"),
@@ -65,4 +68,5 @@ def page_config():
         "verdicts": {v: {"colour": c, "icon": i, "headline": h, "detail": VERDICT_DETAIL[v]}
                      for v, (c, i, h) in VERDICT_STYLE.items()},
         "verdictOrder": list(VERDICT_ORDER),
+        "protected": {"label": PROTECTED_LABEL, "colour": PROTECTED_COLOUR},
     }

@@ -54,7 +54,7 @@ app.py  MainWindow ─┬─ toolbar, tabs [Map | Compare], status bar, event hu
 | File | Job |
 |---|---|
 | `app.py` | the main window, toolbar, actions, events, job routing, CLI flags, stylesheet |
-| `backend.py` | puts `../backend/database` on `sys.path` and re-exports `common`, `maps`, `polygon_approach`, `stencil_approach` |
+| `backend.py` | puts `../backend/database` on `sys.path` and re-exports `common`, `maps`, `polygon_approach`, `protected_areas`, `stencil_approach` |
 | `neon_service.py` | **the only code that talks to Neon.** Plain Python, no Qt. `list_maps`, `open_map(name)`, `upload_map` (only for `smoke_maps.py`'s throwaway map; no menu reaches it), `describe_map`, `rename_map`, `delete_map`, `map_info`, `check`, `_measure`, `saved_farms`, `benchmark`, plus `UploadProgress` and `copy_to_tiff_folder` |
 | `maps_ui.py` | the Map dropdown and Maps ▾ menu (`MapsController`), `RenameDialog`, `DeleteDialog`; with no maps, points to the ingest window; which map shows at start-up; each map's drawn farms while the app is open |
 | `metering.py` | `MeteredConnection` (logs every query an approach sends: round trips, rows, bytes, time), `summarise`, `explain` (EXPLAIN ANALYZE re-run, always rolled back) |
@@ -64,7 +64,7 @@ app.py  MainWindow ─┬─ toolbar, tabs [Map | Compare], status bar, event hu
 | `tiles.py` | tile maths, palette PNG encoder (zlib only), the `eudr://` scheme handler |
 | `worker.py` | the `QThread` job queue: `submit`, `cancel`, `stop`, and coalescing of repeated jobs |
 | `pages.py`, `map_area.py` | the map page loader, the bridge, and Qt widgets floating over the map |
-| `eudr_layer.py`, `web/map_eudr.js` | the colour-coded layer, legend, opacity, Layers menu, loading/error banner with Retry |
+| `eudr_layer.py`, `web/map_eudr.js` | the colour-coded layer, legend, opacity, Layers menu, loading/error banner with Retry; the map's protected areas (`open_map` reads them into `service.protected`; dashed outlines in the `protected` pane, with a legend row and a Layers toggle) |
 | `checks_ui.py` | Point tool, Open ▾, Check ▾ and its options, stale and deleted detection, `open_path` |
 | `results_panel.py` | results table, and per-question "Stencils vs outlines · last check" comparison |
 | `compare_tab.py`, `farmgen.py` | the benchmark tab, and seeded made-up farms (points, plus 0.5–20 ha polygons) |

@@ -23,7 +23,7 @@ The app connects with `DATABASE_URL` from the project's `.env`, the same as the 
 frontend\.venv\Scripts\python frontend\app.py
 ```
 
-1. **The map tab** loads the map chosen in the **Map** dropdown (top left) from Neon: its `grid_info`, then every stencil page in one query. It is drawn colour-coded by class. The legend shows each class's share, and its ticks hide or show a class.
+1. **The map tab** loads the map chosen in the **Map** dropdown (top left) from Neon: its `grid_info`, then every stencil page in one query. It is drawn colour-coded by class. The legend shows each class's share, and its ticks hide or show a class. If the map was ingested with protected areas (`wdpa*.geojson` files; see `backend/README.md`), they are drawn as dashed yellow outlines, with the area's name, designation and IUCN category on hover. They have their own row in the legend and in **Layers ▾**, and either one hides or shows them. Reading them costs one more query when the map loads.
 2. **Drawing farms.** Draw farms with **Polygon (P)** or **Point (O)**, or add them from a file with **Open ▸ GeoJSON file…**.
 3. **Checking.** Press **Check (Ctrl+Enter)**. Each farm is checked by both approaches, with these results:
    - the verdict is the worse of the two: Compliant, Not compliant, Needs review, …;

@@ -5,14 +5,18 @@ NeonService.open_map(name) reads the map's grid_info and every stencil page (one
 that, with no database work per tile. Which map to load is decided by maps_ui.MapsController.
 The legend and the loading/error banner are Qt widgets floating over the map. The toolbar
 gets a Layers menu and an opacity slider; the status bar says whether Neon is connected.
+A map stored with protected areas (backend protected_areas.py: wdpa*.geojson files given at ingest)
+gets them drawn over it as a dashed outline, with a row in the legend and in the Layers menu.
 """
 
 from functools import partial
 
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QIcon, QPixmap
+from PyQt5.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (QAction, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QMenu,
                              QPushButton, QSlider, QToolButton)
+
+from legend import PROTECTED_COLOUR, PROTECTED_LABEL
 
 
 def share_text(pct):
@@ -22,6 +26,21 @@ def share_text(pct):
 def colour_icon(colour, size=12):
     pix = QPixmap(size, size)
     pix.fill(QColor(colour))
+    return QIcon(pix)
+
+
+def outline_icon(colour, size=12):
+    """A see-through square with a coloured border: the protected areas' key."""
+    pix = QPixmap(size, size)
+    fill = QColor(colour)
+    fill.setAlpha(60)
+    pix.fill(fill)
+    painter = QPainter(pix)
+    pen = QPen(QColor(colour))
+    pen.setWidth(2)
+    painter.setPen(pen)
+    painter.drawRect(1, 1, size - 2, size - 2)
+    painter.end()
     return QIcon(pix)
 
 
@@ -35,15 +54,19 @@ def label(text, role=None):
 
 class Legend(QFrame):
     """The map's key: each class's colour, name and share of the map. Unticking a class hides it
-    on the map; hidden_changed gives the sorted list of hidden class codes."""
+    on the map; hidden_changed gives the sorted list of hidden class codes. A map with protected
+    areas gets one more row; unticking it hides them (protected_toggled)."""
 
     hidden_changed = pyqtSignal(object)
+    protected_toggled = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("overlay")
         self.hidden = set()
         self.checkboxes = []
+        self.protected_box = None
+        self.protected_shown = True
         self.grid = QGridLayout(self)
         self.grid.setContentsMargins(10, 8, 10, 8)
         self.grid.setHorizontalSpacing(12)
@@ -56,6 +79,7 @@ class Legend(QFrame):
             if item.widget():
                 item.widget().deleteLater()
         self.checkboxes = []
+        self.protected_box = None
         self.grid.addWidget(label(f"EUDR map · {info['map_version']}", "title"), 0, 0, 1, 2)
         for row, c in enumerate(info["classes"], start=1):
             box = QCheckBox(c["label"])
@@ -67,9 +91,29 @@ class Legend(QFrame):
             self.grid.addWidget(box, row, 0)
             self.grid.addWidget(share, row, 1)
             self.checkboxes.append(box)
+        row = len(info["classes"]) + 1
+        count = info.get("protected_areas") or 0
+        if count:
+            box = QCheckBox(PROTECTED_LABEL)
+            box.setIcon(outline_icon(PROTECTED_COLOUR))
+            box.setChecked(self.protected_shown)
+            box.setToolTip("Protected areas (WDPA) stored with this map in Neon")
+            box.toggled.connect(self.toggle_protected)
+            n = label(f"{count:,}", "secondary")
+            n.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.grid.addWidget(box, row, 0)
+            self.grid.addWidget(n, row, 1)
+            self.protected_box = box
+            row += 1
         note = label(f"From the stencils in Neon · {info['width']:,} × {info['height']:,} px", "muted")
-        self.grid.addWidget(note, len(info["classes"]) + 1, 0, 1, 2)
+        self.grid.addWidget(note, row, 0, 1, 2)
         self.show()
+
+    def toggle_protected(self, visible):
+        self.protected_shown = visible
+        if self.protected_box is not None and self.protected_box.isChecked() != visible:
+            self.protected_box.setChecked(visible)
+        self.protected_toggled.emit(visible)
 
     def toggle(self, code, visible):
         if visible:
@@ -121,6 +165,7 @@ class EudrLayer:
 
         self.legend = Legend()
         self.legend.hidden_changed.connect(lambda codes: window.map.call("setHiddenClasses", codes))
+        self.legend.protected_toggled.connect(self.set_protected_visible)
         window.map_area.add_overlay(self.legend, "bottom-left", (12, 34))  # above Leaflet's scale bar
         self.banner = Banner()
         self.banner.retry.connect(lambda: self.banner_action())
@@ -130,6 +175,10 @@ class EudrLayer:
         self.layer_act.toggled.connect(self.set_visible)
         self.layers_menu = QMenu(window)
         self.layers_menu.addAction(self.layer_act)
+        self.protected_act = QAction(PROTECTED_LABEL + " (WDPA)", window, checkable=True, checked=True)
+        self.protected_act.setEnabled(False)  # until a map with protected areas is shown
+        self.protected_act.toggled.connect(self.set_protected_visible)
+        self.layers_menu.addAction(self.protected_act)
         layers_btn = QToolButton()
         layers_btn.setText("Layers")
         layers_btn.setIcon(window.icon("layers"))
@@ -150,6 +199,19 @@ class EudrLayer:
     def set_visible(self, on):
         self.w.map.call("setOverlayVisible", on)
         self.legend.setVisible(on and self.info is not None)
+
+    def set_protected_visible(self, on):
+        """Show or hide the protected areas (from the Layers menu or the legend; both follow)."""
+        if self.protected_act.isChecked() != on:
+            self.protected_act.setChecked(on)
+        if self.legend.protected_shown != on:
+            self.legend.toggle_protected(on)
+        self.w.map.call("setProtectedVisible", on)
+
+    def show_protected(self, fc):
+        """Draw the map's protected areas (None: it has none)."""
+        self.protected_act.setEnabled(bool(fc and fc.get("features")))
+        self.w.map.call("setProtectedAreas", fc)
 
     def show_banner(self, text, error=False, button=None, action=None):
         """A message over the map. With an action, a button runs it ('Retry' unless named)."""
@@ -174,6 +236,7 @@ class EudrLayer:
         self.w.tile_handler.set_map(service.grid, service.classes, service.to_map)
         self.info = info
         self.w.map.call("setMapInfo", info)
+        self.show_protected(service.protected)
         self.legend.set_info(info)
         self.banner.hide()
         self.w.map_area.relayout()
@@ -201,6 +264,7 @@ class EudrLayer:
         self.w.map_info = None
         self.w.tile_handler.set_map(None, None)
         self.w.map.call("clearMapInfo")
+        self.protected_act.setEnabled(False)
         self.legend.hide()
         self.neon_label.setText("Neon: connected · no map shown")
         self.show_banner(text, button=button, action=action)
