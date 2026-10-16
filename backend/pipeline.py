@@ -91,7 +91,8 @@ def check_plots(out: str, name: str, plot_files: list[str], min_ha: float) -> bo
         for path in plot_files:
             plots, features = evidence_approach.read_plots(common.find_geojson(path))
             rows, timings = evidence_approach.check(conn, grid, plots, min_ha)
-            evidence_approach.save_results(conn, grid, features, rows)
+            protected = evidence_approach.protected_plots(conn, grid, plots, rows)
+            evidence_approach.save_results(conn, grid, features, rows, protected)
             expected, seconds = eudr_layers.query_plots(plots, evidence, jgrid, eudr_layers.row_areas_m2(jgrid),
                                                         rule, min_ha)
             differ = [r["plot_id"] for r, e in zip(rows, expected) if eudr_layers.compare_outputs(r, e)]
@@ -101,7 +102,7 @@ def check_plots(out: str, name: str, plot_files: list[str], min_ha: float) -> bo
                   f"({timings['pages']} pages); evidence.tif on disk took {seconds:.3f} s")
             print(f"  Every output the same as eudr_layers.py from evidence.tif: {n - len(differ)} of {n} plots"
                   + (f" - DIFFERENT: {', '.join(differ[:10])}" if differ else ""))
-            evidence_approach.print_summary(rows, timings)
+            evidence_approach.print_summary(rows, timings, protected)
     return same_everywhere
 
 

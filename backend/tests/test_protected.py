@@ -6,6 +6,9 @@ import os
 import tempfile
 import unittest
 
+import shapely
+from shapely.geometry import shape
+
 import common
 import protected_areas
 from tests.fakes import Script, quietly
@@ -105,6 +108,84 @@ class ProtectedAreasTest(unittest.TestCase):
         self.assertEqual(fc["features"][0]["properties"],
                          {"wdpa_id": "1", "name": "Berbak", "designation": "National Park", "iucn_cat": "II"})
         self.assertEqual(fc["features"][0]["geometry"]["type"], "Polygon")
+
+
+WITH_AREAS = common.Grid("jambi", 103.0, -1.0, 1 / 8000, 1 / 8000, 800, 800, 4326, True, schema="map_jambi",
+                         tables=frozenset({"protected_areas"}))
+
+
+def farm(plot_id, geom):
+    return common.Farm(plot_id, {}, geom, "point" if geom.geom_type == "Point" else "outline")
+
+
+class ProtectedCheckTest(unittest.TestCase):
+    """A farm in a protected area needs review: check() finds those farms, apply() marks them."""
+
+    def setUp(self):
+        from shapely.geometry import Point
+        self.farms = [farm("in", Point(103.02, -1.04)),
+                      farm("half", shape(square(103.01, -1.05, 0.002))),
+                      farm("edge", shape(square(103.03, -1.05, 0.002))),
+                      farm("away", Point(103.08, -1.08))]
+        inside = shapely.to_wkb(shape(square(103.01, -1.05, 0.001)))   # a quarter of "half"
+        sliver = shapely.to_wkb(shape(square(103.03, -1.05, 1e-9)))    # "edge": next to nothing
+        self.conn = Script([("ST_Intersects(p.geom, f.geom)",
+                             [(0, ["Berbak"], None), (1, ["Berbak", "WDPA 9"], inside), (2, ["Berbak"], sliver)])])
+
+    def test_a_map_without_protected_areas_sends_no_query(self):
+        conn = Script()
+        self.assertEqual(protected_areas.check(conn, GRID, self.farms), {})
+        self.assertEqual(conn.sql, [])
+
+    def test_one_query_finds_points_inside_and_outlines_overlapping_by_more_than_an_edge(self):
+        found = protected_areas.check(self.conn, WITH_AREAS, self.farms)
+        self.assertEqual(len(self.conn.sql), 1)                    # one round trip for every farm
+        self.assertIn("map_jambi.protected_areas", self.conn.sql[0])
+        self.assertEqual(sorted(found), [0, 1])                    # "edge" only touches; "away" is outside
+        self.assertEqual(found[0], protected_areas.Overlap(("Berbak",), 0.0))
+        self.assertEqual(found[1].names, ("Berbak", "WDPA 9"))
+        quarter = common.area_m2(self.farms[1].geom, WITH_AREAS) / 4
+        self.assertAlmostEqual(found[1].m2, quarter, delta=quarter * 1e-6)
+
+    def test_apply_sends_lesser_verdicts_for_review_and_keeps_deforestation(self):
+        found = protected_areas.check(self.conn, WITH_AREAS, self.farms)
+        results = [common.PlotResult(f.plot_id, f.kind, verdict=v) for f, v in
+                   zip(self.farms, (common.PASS, common.FAIL, common.PASS, common.CHECK_LOCATION))]
+        protected_areas.apply(results, found)
+        self.assertEqual([r.verdict for r in results],
+                         [common.MANUAL_REVIEW, common.FAIL, common.PASS, common.CHECK_LOCATION])
+        self.assertEqual([r.outcome for r in results[:2]], [common.NEEDS_REVIEW, common.NON_COMPLIANT])
+        self.assertEqual((results[0].map_verdict, results[1].map_verdict, results[2].map_verdict),
+                         (common.PASS, common.FAIL, None))
+        self.assertTrue(results[0].in_protected)
+        self.assertFalse(results[2].in_protected)
+        self.assertEqual(results[0].note, "in a protected area: Berbak")
+        self.assertAlmostEqual(results[1].protected_ha, found[1].m2 / 10_000)
+
+
+class EvidenceOutcomeTest(unittest.TestCase):
+    """Evidence checks keep Joe's verdict; only the outcome counts protected areas."""
+
+    def test_deforested_fails_protected_needs_review_otherwise_compliant(self):
+        import evidence_approach as ev
+        free, cleared = {"verdict": "deforestation-free"}, {"verdict": "non-compliant"}
+        self.assertEqual(ev.outcome(cleared, ("Berbak",)), common.NON_COMPLIANT)
+        self.assertEqual(ev.outcome(free, ("Berbak",)), common.NEEDS_REVIEW)
+        self.assertEqual(ev.outcome(free), common.COMPLIANT)
+        self.assertEqual(ev.outcome({"verdict": "needs review"}), common.NEEDS_REVIEW)
+
+    def test_protected_plots_uses_the_stored_areas_or_else_the_evidence_fact(self):
+        import geopandas as gpd
+        import evidence_approach as ev
+        plots = gpd.GeoDataFrame({"plot_id": ["a", "b", "c"]}, crs="EPSG:4326", geometry=[
+            shape(square(103.01, -1.05, 0.002)), shape(square(103.05, -1.05, 0.002)),
+            shape(square(103.07, -1.05, 0.002))])
+        rows = [{"protected_ha": 0.0}, {"protected_ha": 1.5}, {"protected_ha": ""}]   # "": screened
+        inside = shapely.to_wkb(shape(square(103.01, -1.05, 0.002)))
+        conn = Script([("ST_Intersects(p.geom, f.geom)", [(0, ["Berbak"], inside)])])
+        self.assertEqual(ev.protected_plots(conn, WITH_AREAS, plots, rows),
+                         [("Berbak",), (ev.FROM_EVIDENCE,), ()])
+        self.assertEqual(len(conn.sql), 1)
 
 
 if __name__ == "__main__":

@@ -60,6 +60,18 @@ Each TIFF pixel holds one value:
 - The worst colour a farm touches decides its verdict (`common.decide`): `FAIL`, then
   `MANUAL_REVIEW`, then `CANNOT_CHECK` (also for farms outside the map), then `CHECK_LOCATION`,
   then `PASS`.
+- **Protected areas.** A farm in a protected area stored with the map (a point inside one, or an
+  outline overlapping one by more than the exact-area rule) needs review: a legality risk under the
+  EUDR, not proof of deforestation. `protected_areas.check(conn, grid, farms)` finds those farms in one
+  query (none for a map without `protected_areas`), and `protected_areas.apply(results, found)` turns
+  any verdict below `MANUAL_REVIEW` into `MANUAL_REVIEW`; `FAIL` stays. It sets `PlotResult.protected_areas`
+  (names), `protected_ha`, `map_verdict` (the map's own verdict) and the note. It runs after each
+  approach's check, the same for stencils, outlines and the TIFF baseline, so their answers stay
+  comparable and the approaches' timings don't include it. `compare.py` applies it only to the verdicts
+  it saves, after the fidelity figures. Evidence-page checks keep Joe's verdict and reason exactly;
+  only their outcome counts protected areas (`evidence_approach.protected_plots` and `outcome`:
+  deforestation-free in a protected area → `NEEDS_REVIEW`), kept apart from the rows so they still
+  match `eudr_layers.py`'s outputs.
 - Forest alone never fails a farm: under the EUDR only deforestation after the cut-off does.
 - The two key queries: "is the point in forest?" and "does this outline overlap forest?".
 - A point takes the colour of the pixel it lands on.
@@ -87,8 +99,9 @@ Each TIFF pixel holds one value:
 - `database/protected_areas.py`: protected areas (WDPA polygons, files named `wdpa*.geojson`), cut to the
   map and stored in its `protected_areas` table (PostGIS). `maps.upload` stores those in a results folder
   (or `protected=[files]`); `pipeline.py` finds them in `--data-dir`, passes them to `eudr_layers.py`
-  as `--protected` and saves the cut copy `wdpa_protected_areas.geojson` in the results folder. Display
-  only: no check reads them (the evidence's own `protected` bit comes from Joe's `--protected`).
+  as `--protected` and saves the cut copy `wdpa_protected_areas.geojson` in the results folder. The app
+  draws them, and the stencil and outline checks send farms in them for review (`check` / `apply`, see
+  above). The evidence's own `protected` bit comes from Joe's `--protected`.
 - `database/stencil_approach.py`: stencils, 8 × 8 bitmaps packed into 64-bit numbers and zipped
   per 256 × 256 page (same commands).
 - `database/maps.py`: several maps, one schema each (`list` / `upload` both approaches / `rename` / `delete` /
@@ -148,6 +161,7 @@ Show the commands and their output as evidence.
   - Every query names its tables with `grid.table("...")`, never through `search_path`. A `SET LOCAL` would cost a round trip per transaction, and it doesn't reach `VACUUM`.
   - `load_grid(conn, name)` and `find_map` choose the map.
 - **Uploads are atomic.** `maps.upload` builds every approach (stencils, outlines, and for a results folder the evidence pages) in one transaction with `tidy=False`, then runs `VACUUM`. A failure or Ctrl+C leaves nothing behind.
+- **Data Neon already holds is not uploaded again.** Before writing, `maps.upload` fingerprints the 5 colours (`common.scan_map`) and, if some map has evidence pages, `evidence.tif` (`evidence_approach.fingerprint_of`, the same digest as `evidence_info.fingerprint`). `find_stored` picks the stored map with the most matching parts; `copy_stored` makes the new map's tables from them inside Neon (`INSERT ... SELECT`, sections from `schema.sql`, in the same transaction), and only the missing parts are built (`build(..., allow_copy=True)` lets `start_build` accept a fingerprint stored under another name). A taken name is still refused. Pass `allow_copy` only when copying: the frontend's tests replace `build` with the documented signature.
 - **PostGIS stays in `public`** (`CREATE EXTENSION ... SCHEMA public`), so dropping a map's schema can never remove it.
 - **A map's schema always follows its name.** `maps.rename` renames the schema (`ALTER SCHEMA ... RENAME`) and updates `grid_info.map_version`, `plot_results.map_version` and `public.maps`, in one transaction.
 - **`maps.delete` is guarded.** It needs the exact name, and drops only a schema that is listed in `public.maps` and matches `^map_[a-z0-9_]+$`.
@@ -203,7 +217,7 @@ maps, `frontend\smoke_maps.py` (writes only a throwaway map).
   - `TIFF_DIR`, `PAGE`, `COLOURS`, `VERDICTS`, the class constants, `FOREST_2020` (forest on the cut-off date in the 5 colours: forest, deforestation, needs review)
   - `Grid`: its fields (`x0`, `y0`, `pixel_w`, `pixel_h`, `width`, `height`, `srid`, `default_class`, `fingerprint`, `map_version`, `schema`), plus `table()`, `point_to_pixel`, `pixel_centre`, `inside`, `bounds_box`, `from_dataset` and `==` (which ignores `schema`)
   - `Farm` (`plot_id`, `kind` = `point` / `outline`, `geom`)
-  - `PlotResult` (`verdict`, `present`, `point_colour`, `ha()`, `water_share`, `outside`, `note`, `key()`, `outcome`, and the two key questions: `in_forest_2020`, `forest_2020_ha()`)
+  - `PlotResult` (`verdict`, `present`, `point_colour`, `ha()`, `water_share`, `outside`, `note`, `key()`, `outcome`, the two key questions: `in_forest_2020`, `forest_2020_ha()`, and protected areas: `protected_areas`, `protected_ha`, `map_verdict`, `in_protected`)
   - `OUTCOMES`, `OUTCOME_OF`, `outcome_of(verdict)`: every verdict (both vocabularies) → `COMPLIANT`, `NON_COMPLIANT` or `NEEDS_REVIEW`. The app's verdict styles are built from it (`legend.VERDICT_STYLE`)
 - Both approaches:
   - `check(conn, grid, farms[, all_touched])` returns `(results in farm order, {"total_s": ...})`.
@@ -213,7 +227,7 @@ maps, `frontend\smoke_maps.py` (writes only a throwaway map).
 - Both approaches: `ensure_built(conn, grid)`, `build(conn, tif, map_name, report=None, tidy=True)` (returns the `Grid`), `verify(conn, grid, tif)`.
 - `stencil_approach`: `page_size`, `unzip_page` (→ the page's colours, height × width uint8), `pack_page`, `fetch_pages`. The frontend rebuilds the whole map from `SELECT page_col, page_row, colours FROM {grid.table('stencil_pages')}`, and pages with no row are `default_class`.
 - `maps.upload(conn, source, name, report, outlines=True, protected=None)`; `common.has_tables`, `Grid.tables` (the frontend's `need_outlines` reads it).
-- `protected_areas.load(conn, grid)` → a GeoJSON FeatureCollection in lon/lat (properties `wdpa_id`, `name`, `designation`, `iucn_cat`) or None; one query, none when the map has no `protected_areas`. `protected_areas` must never import pandas, geopandas or `eudr_layers`.
+- `protected_areas.load(conn, grid)` → a GeoJSON FeatureCollection in lon/lat (properties `wdpa_id`, `name`, `designation`, `iucn_cat`) or None; one query, none when the map has no `protected_areas`. `protected_areas.check(conn, grid, farms)` → `{farm index: Overlap(names, m2)}` and `apply(results, found)` (`neon_service.check` runs them once and applies them to every method). `protected_areas` must never import pandas, geopandas or `eudr_layers`.
 - `common.TIFF_DIR` (= `LAYERS_DIR`) plus `grid_info.source_file` is where the frontend looks for the reference TIFF.
 - The frontend's environment has no scipy or pandas. So `common`, `maps`, `stencil_approach` and `polygon_approach` must never import `layers`, `evidence_approach` or `eudr_layers` at module level. `maps.upload` imports them only for a results folder.
 

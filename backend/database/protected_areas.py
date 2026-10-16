@@ -15,6 +15,14 @@ map as "protected areas".
 Points (WDPA's areas with no boundary) are skipped: there is no shape to draw. An area that is in
 several files (same WDPA_PID / WDPAID) is stored once. Needs PostGIS, like the outlines.
 
+Checks: a farm in a protected area needs review. Under the EUDR it is a legality risk (is farming
+allowed there?), not proof of deforestation. check() finds those farms in one query, for any batch
+of farms; apply() marks them on an approach's answers and turns any lesser verdict into
+MANUAL_REVIEW. Deforestation stays FAIL. Stencils, outlines and the TIFF baseline all get the same
+step, so they still agree with each other. Evidence-page checks keep Joe's verdict and reason
+as he gives them; evidence_approach.outcome makes a deforestation-free plot in a protected area
+NEEDS_REVIEW (protected_plots uses check() too).
+
 Commands (run from the backend folder)
     python database/protected_areas.py add "Jambi v1" wdpa_IDN.geojson [more files]   # replaces the map's own
     python database/protected_areas.py show "Jambi v1"                                 # what is stored
@@ -31,6 +39,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import shapely
 from pyproj import Transformer
 from shapely.geometry import MultiPolygon, mapping, shape
@@ -42,6 +51,8 @@ PREFIX = "wdpa"                              # a protected-area file's name star
 SUFFIX = ".geojson"
 TABLE = "protected_areas"
 FOLDER_COPY = "wdpa_protected_areas.geojson"  # the cut copy pipeline.py saves in the results folder
+UNNAMED = "unnamed protected area"            # an area whose file gave it no name or WDPA id
+JIT_OFF_FARMS = 50                            # switch PostgreSQL's JIT off for batches this big (common.no_jit)
 
 
 @dataclass
@@ -184,6 +195,69 @@ def load(conn, grid: common.Grid) -> dict | None:
         {"type": "Feature", "geometry": json.loads(geojson),
          "properties": {"wdpa_id": wdpa_id, "name": name, "designation": designation, "iucn_cat": iucn}}
         for wdpa_id, name, designation, iucn, geojson in rows]}
+
+
+# --------------------------------------------------------------------------------------
+# checks: which farms lie in a protected area
+# --------------------------------------------------------------------------------------
+@dataclass
+class Overlap:
+    names: tuple             # the protected areas the farm is in, sorted
+    m2: float                # how much of the farm is inside them (0 for a point)
+
+
+def check(conn, grid: common.Grid, farms: list[common.Farm]) -> dict[int, Overlap]:
+    """Which farms lie in a protected area: {index in farms: Overlap}, in one query.
+    A point counts if it is inside an area (or on its edge). An outline counts if it overlaps the
+    areas by more than the outlines' exact-area rule (common.MIN_OVERLAP_M2 / MIN_OVERLAP_SHARE),
+    so a farm that only touches an area along an edge doesn't. Overlapping areas are counted once.
+    A map with no protected areas sends nothing (load_grid's list of tables says so). Uses only
+    conn.cursor(), execute and fetchall, like the approaches' checks."""
+    idx = [i for i, farm in enumerate(farms) if not farm.geom.is_empty]
+    if TABLE not in grid.tables or not idx:
+        return {}
+    geoms = shapely.set_srid(np.asarray([farms[i].geom for i in idx], dtype=object), grid.srid)
+    with conn.cursor() as cur:
+        if len(idx) >= JIT_OFF_FARMS:
+            common.no_jit(cur)
+        cur.execute(f"""
+            SELECT f.idx,
+                   array_agg(DISTINCT COALESCE(NULLIF(p.name, ''), 'WDPA ' || p.wdpa_id, '{UNNAMED}')),
+                   ST_AsBinary(ST_Union(CASE WHEN ST_Dimension(f.geom) = 2
+                                             THEN ST_Intersection(p.geom, f.geom) END))
+            FROM (SELECT q.idx, ST_GeomFromEWKB(q.g) AS geom
+                  FROM unnest(%s::int[], %s::bytea[]) AS q(idx, g)) AS f
+            JOIN {grid.table(TABLE)} p ON ST_Intersects(p.geom, f.geom)
+            GROUP BY f.idx""", (idx, list(shapely.to_wkb(geoms, include_srid=True))))
+        rows = cur.fetchall()
+    found = {}
+    for i, names, inside in rows:
+        farm = farms[i]
+        if farm.geom.geom_type in ("Polygon", "MultiPolygon"):
+            m2 = common.area_m2(shapely.from_wkb(bytes(inside)), grid) if inside else 0.0
+            if m2 <= max(common.MIN_OVERLAP_M2, common.MIN_OVERLAP_SHARE * common.area_m2(farm.geom, grid)):
+                continue                       # touches an area along its edge only
+        else:
+            m2 = 0.0
+        found[i] = Overlap(tuple(sorted(names)), m2)
+    return found
+
+
+def apply(results: list, found: dict[int, Overlap]) -> None:
+    """Mark the farms check() found on one approach's answers (in farm order), and send them for
+    review: every verdict less serious than MANUAL_REVIEW becomes MANUAL_REVIEW, and FAIL stays.
+    The verdict the map alone gave is kept as map_verdict. Give every approach the same found, so
+    their answers stay comparable."""
+    review = common.VERDICTS.index(common.MANUAL_REVIEW)
+    for i, overlap in found.items():
+        res = results[i]
+        if res is None:
+            continue
+        res.protected_areas, res.protected_ha = overlap.names, overlap.m2 / 10_000
+        res.map_verdict = res.verdict
+        if common.VERDICTS.index(res.verdict) > review:
+            res.verdict = common.MANUAL_REVIEW
+        res.note = "; ".join(filter(None, [res.note, "in a protected area: " + ", ".join(overlap.names)]))
 
 
 # --------------------------------------------------------------------------------------

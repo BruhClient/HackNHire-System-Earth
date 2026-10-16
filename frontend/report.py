@@ -6,6 +6,7 @@ from legend import (CLASS_LABELS, CLASSES, DEFORESTATION, FOREST, NO_DATA, REVIE
                     VERDICT_STYLE)
 
 METHOD_KEYS = ("stencils", "polygons", "tiff_pixel", "tiff_exact")
+PROTECTED_DETAIL = "in a protected area: check farming is allowed there"
 
 
 def worst(verdicts):
@@ -30,7 +31,18 @@ def result_json(r):
         "water_share": round(float(r.water_share), 6),
         "outside": bool(r.outside),
         "note": r.note,
+        # protected areas (the backend's protected_areas.apply): a farm in one needs review
+        "protected_areas": list(r.protected_areas),
+        "protected_ha": round(float(r.protected_ha), 6),
+        "map_verdict": r.map_verdict,   # the map's own verdict, when the farm is in a protected area
     }
+
+
+def verdict_detail(res):
+    """Why one method's answer needs review (or fails): the map's reason, or the protected area
+    when that is what sent the farm for review."""
+    own = res.get("map_verdict") or res["verdict"]
+    return VERDICT_DETAIL[res["verdict"]] if own == res["verdict"] else PROTECTED_DETAIL
 
 
 def farm_row(key, name, kind, area_ha, results):
@@ -140,6 +152,12 @@ def _outline_sentence(verdict, res, area_ha):
             + f" {fmt_ha(ha(FOREST))} of it still stands (allowed under the EUDR).")
 
 
+def _protected_sentence(kind, res):
+    names = ", ".join(res["protected_areas"])
+    where = "The point is" if kind == "point" else f"{fmt_ha(float(res['protected_ha']))} of the farm is"
+    return f" {where} in a protected area ({names}), so a person has to check that farming is allowed there."
+
+
 def verdict_card(row):
     """The focus view's headline and sentence. The headline is the worse of the two approaches'
     verdicts; the hectares come from the approach that gave it (the outlines on a tie)."""
@@ -147,7 +165,10 @@ def verdict_card(row):
     colour, icon, headline = VERDICT_STYLE[verdict]
     source = "polygons" if row["results"]["polygons"]["verdict"] == verdict else "stencils"
     res = row["results"][source]
-    sentence = (_point_sentence(verdict, res) if row["kind"] == "point"
-                else _outline_sentence(verdict, res, row["area_ha"]))
+    own = res.get("map_verdict") or verdict   # the map's own verdict: its sentence, then the protected area's
+    sentence = (_point_sentence(own, res) if row["kind"] == "point"
+                else _outline_sentence(own, res, row["area_ha"]))
+    if res.get("protected_areas"):
+        sentence += _protected_sentence(row["kind"], res)
     return {"outcome": row["outcome"], "verdict": verdict, "colour": colour, "icon": icon, "headline": headline,
-            "detail": VERDICT_DETAIL[verdict], "sentence": sentence, "source": source}
+            "detail": verdict_detail(res), "sentence": sentence, "source": source}

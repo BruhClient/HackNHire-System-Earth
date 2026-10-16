@@ -50,6 +50,7 @@ import shapely
 from rasterio.features import rasterize
 
 import common
+import protected_areas
 
 METHOD = "polygons"
 TABLES = ["class_polys", "square_labels"]
@@ -99,13 +100,13 @@ def ensure_built(conn, grid: common.Grid) -> None:
 # --------------------------------------------------------------------------------------
 # build: trace every colour except the most common one, tile by tile, and upload
 # --------------------------------------------------------------------------------------
-def build(conn, tif: str, map_name: str, report=None, tidy: bool = True) -> common.Grid:
+def build(conn, tif: str, map_name: str, report=None, tidy: bool = True, allow_copy: bool = False) -> common.Grid:
     """Trace the TIFF into the map's class_polys and square_labels. report(label, done, total)
     follows the progress. tidy=False leaves the transaction open and skips VACUUM (maps.upload
     builds both approaches in one transaction, then tidies up)."""
     start = time.perf_counter()
     with rasterio.open(tif) as src:
-        grid, counts = common.start_build(conn, src, tif, map_name, OTHER_TABLES, report)
+        grid, counts = common.start_build(conn, src, tif, map_name, OTHER_TABLES, report, allow_copy)
         stored = common.stored_colours(grid, counts)
         polys, labels_table = grid.table("class_polys"), grid.table("square_labels")
         with conn.cursor() as cur:
@@ -330,6 +331,7 @@ def main() -> None:
             grid = common.load_grid(conn, args.map)
             farms = common.load_farms(args.plots, grid, args.point_mode)
             results, timings = check(conn, grid, farms)
+            protected_areas.apply(results, protected_areas.check(conn, grid, farms))
             common.save_results(conn, grid, farms, results, METHOD)
             common.print_summary(METHOD, results, timings)
             common.write_csv(args.csv, results)

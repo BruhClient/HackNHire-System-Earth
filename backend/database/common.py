@@ -76,7 +76,7 @@ MIN_OVERLAP_SHARE = 1e-6
 WATER_MAJORITY = 0.5  # an outline that is more than half water -> location probably wrong
 
 FAIL = "FAIL"                      # deforestation found
-MANUAL_REVIEW = "MANUAL_REVIEW"    # the map is unsure
+MANUAL_REVIEW = "MANUAL_REVIEW"    # the map is unsure, or the farm is in a protected area
 CANNOT_CHECK = "CANNOT_CHECK"      # outside the map, or on no-data pixels
 CHECK_LOCATION = "CHECK_LOCATION"  # on water: coordinates are probably wrong
 PASS = "PASS"                      # only land and/or forest
@@ -684,11 +684,12 @@ def verify_report(name: str, stats: dict) -> None:
 
 
 def start_build(conn: psycopg.Connection, src, tif_path: str, map_name: str,
-                other_tables: dict[str, str], report=None) -> tuple[Grid, np.ndarray]:
+                other_tables: dict[str, str], report=None, allow_copy: bool = False) -> tuple[Grid, np.ndarray]:
     """Scan the map, choose the colour to leave out, and store the address system in the map's own
     schema (created if needed) and in the list of maps. Refuses a name too close to another map's,
-    and a TIFF that is already stored under another name. If this map held a DIFFERENT TIFF
-    before, the other approach's tables are removed, so a map never mixes two TIFFs."""
+    and a TIFF that is already stored under another name (unless allow_copy: maps.upload is making
+    a copy of that map, reusing what Neon has). If this map held a DIFFERENT TIFF before, the other
+    approach's tables are removed, so a map never mixes two TIFFs."""
     name = map_name.strip()
     schema = map_schema(name)
     grid = Grid.from_dataset(src, name)
@@ -708,8 +709,9 @@ def start_build(conn: psycopg.Connection, src, tif_path: str, map_name: str,
         cur.execute("SELECT name FROM public.maps WHERE fingerprint = %s AND name <> %s",
                     (fingerprint, name))
         same = cur.fetchone()
-        if same:
-            sys.exit(f"This TIFF is already stored as '{same[0]}'.")
+        if same and not allow_copy:
+            sys.exit(f"This TIFF is already stored as '{same[0]}'. Use that map, or upload with "
+                     "python database/maps.py upload, which reuses what Neon already has.")
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
         cur.execute(map_tables_sql(grid))
         cur.execute(f"SELECT fingerprint FROM {grid.table('grid_info')} LIMIT 1")
@@ -918,6 +920,11 @@ class PlotResult:
     water_share: float = 0.0
     outside: bool = False
     note: str = ""
+    # protected areas (protected_areas.apply): the names of those the farm lies in, the hectares of
+    # it inside them (outlines; 0 for points), and the verdict the map alone gave before that
+    protected_areas: tuple = ()
+    protected_ha: float = 0.0
+    map_verdict: str | None = None
 
     def key(self) -> tuple:
         """Everything a compliance decision uses - what decision fidelity compares:
@@ -939,6 +946,11 @@ class PlotResult:
         """The EUDR's two key questions: is the point in forest that stood on 31 Dec 2020, and does the
         outline overlap it? (Forest since cleared counts: that is what the cut-off date asks about.)"""
         return any(c in self.present for c in FOREST_2020)
+
+    @property
+    def in_protected(self) -> bool:
+        """Lies in a protected area (WDPA), which sends it for review (protected_areas.apply)."""
+        return bool(self.protected_areas)
 
     def ha(self, colour: int) -> float:
         return self.area_m2.get(colour, 0.0) / 10_000
@@ -1028,13 +1040,15 @@ def write_csv(path: str, results: list[PlotResult]) -> None:
         w = csv.writer(fh)
         w.writerow(["plot_id", "kind", "outcome", "verdict", "point_colour", "colours_touched", "in_forest_2020",
                     "forest_2020_ha", "touches_forest", "forest_ha", "land_ha", "deforested_ha", "review_ha",
-                    "water_ha", "no_data_ha", "water_share", "note"])
+                    "water_ha", "no_data_ha", "water_share", "in_protected_area", "protected_ha",
+                    "protected_areas", "note"])
         for r in results:
             w.writerow([r.plot_id, r.kind, r.outcome, r.verdict, CLASS_NAMES.get(r.point_colour, ""),
                         r.colours_text(), r.in_forest_2020, f"{r.forest_2020_ha():.4f}", r.touches_forest,
                         f"{r.ha(FOREST):.4f}", f"{r.ha(LAND):.4f}", f"{r.ha(DEFORESTATION):.4f}",
                         f"{r.ha(REVIEW):.4f}", f"{r.ha(WATER):.4f}", f"{r.ha(NO_DATA):.4f}",
-                        f"{r.water_share:.3f}", r.note])
+                        f"{r.water_share:.3f}", r.in_protected, f"{r.protected_ha:.4f}",
+                        "; ".join(r.protected_areas), r.note])
     print(f"Wrote {nice_path(path)}")
 
 

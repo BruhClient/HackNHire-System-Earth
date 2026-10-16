@@ -28,7 +28,8 @@ frontend\.venv\Scripts\python frontend\app.py
 3. **Checking.** Press **Check (Ctrl+Enter)**. Each farm is checked by both approaches, with these results:
    - the verdict is the worse of the two: Compliant, Not compliant, Needs review, …;
    - each approach's own verdict is shown as an icon;
-   - forest and deforested hectares are listed for outlines.
+   - forest and deforested hectares are listed for outlines;
+   - **Protected** says whether the farm is in a protected area stored with the map ("yes" for a point, the hectares inside for an outline; the names are in the tooltip). Such a farm needs review even if the map finds no clearing, because farming may not be allowed there. Deforestation still makes it Not compliant. This costs one more query per check, which isn't counted in either approach's numbers.
 
    Click a row to zoom to the farm.
 4. **Stencils vs outlines · last check** compares the two approaches on the farms you just checked. There is one block per question:

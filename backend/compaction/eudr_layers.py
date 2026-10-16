@@ -681,8 +681,7 @@ def outcome_classes(fields, valid, water, hansen_alone="review", settled_until=N
             quiet = fields.get("radd_watch", zero) == 1
             out[han & ~rv & quiet & (fields.get("radd_alert", zero) == 0)] = DEGRADED
             if settled_until:                   # TMF has had time to judge and still sees forest
-                settled = han & (h <= settled_until - CUTOFF_YEAR) & np.isin(fields["tmf_2020"], TMF_FOREST_LIKE)
-                out[settled] = DEGRADED
+                settled = han & ~rv & (h <= settled_until - CUTOFF_YEAR) & np.isin(fields["tmf_2020"], TMF_FOREST_LIKE)                out[settled] = DEGRADED
     sel = keep & ~tv & ~hv & rv                 # RADD radar only
     out[sel] = REVIEW + year[sel]
     if hansen_alone == "settle":

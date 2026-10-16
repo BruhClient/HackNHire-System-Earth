@@ -121,13 +121,19 @@ python pipeline.py --name jambi --data-dir D:\eudr\inputs --bbox 103.0 -2.3 103.
 2. **Upload.** The folder goes to Neon as the map `jambi`, with the evidence pages, the stencils
    and the outlines, in one transaction. If anything fails, or you press Ctrl+C, nothing is left
    behind.
+   - **Already in Neon?** If a stored map has the same pixels in the same place (same
+     fingerprint), its stencils, outlines and evidence pages are copied inside Neon instead of
+     being uploaded again; only what it lacks is built and uploaded (e.g. the evidence pages of a
+     map first uploaded from a TIFF). On the Thai test map, a second upload of the same folder took
+     0.7 s instead of 5.2 s (one run each, over Neon). A name that is already taken is still refused.
    - **Protected areas.** Put the WDPA polygons in `--data-dir` as GeoJSON whose file name starts
      with `wdpa` (any case), e.g. `WDPA_Oct2026_Public_IDN-polygons.geojson`. Several files are
      fine. The pipeline finds them by itself and:
      - gives them to `eudr_layers.py` as `--protected`, so the evidence's `protected` fact is set;
      - saves a copy cut to the map as `layers/jambi/wdpa_protected_areas.geojson`;
      - stores them with the map in Neon (`protected_areas`, PostGIS), in the same transaction.
-       The app draws them over the map as "Protected areas".
+       The app draws them over the map as "Protected areas", and every check sends a farm in
+       one for review (see **Verdict** below).
 
      WDPA points (areas with no boundary) are skipped. To add protected areas to a map already in
      Neon: `python database/protected_areas.py add "MAP" wdpa_FILE.geojson` (this replaces the
@@ -265,6 +271,16 @@ nothing about storage. For storage, use `compare.py` on a real results folder.
 | `CANNOT_CHECK` | outside the map, or touches no-data pixels |
 | `CHECK_LOCATION` | point on water, or outline more than half water: coordinates are probably wrong |
 | `PASS` | only land and/or forest |
+
+A farm in a protected area stored with the map (a point inside one, or an outline overlapping
+one by more than a sliver) becomes `MANUAL_REVIEW` if the map alone would give it a lesser
+verdict; `FAIL` stays `FAIL`. Under the EUDR such a farm is a legality risk (is farming allowed
+there?), not proof of deforestation. This is one extra query per check, the same for both
+approaches and not counted in their timings. The CSV and the saved note give the areas' names and
+the hectares inside them (`in_protected_area`, `protected_ha`, `protected_areas`). Evidence-page
+checks keep Joe's verdict and reason, but their outcome counts protected areas too: deforestation
+→ non-compliant; deforestation-free in a protected area → needs review; deforestation-free and in
+none → compliant (saved in `evidence_results.facts` with `protected_areas`, and in the CSV).
 
 Forest doesn't fail a farm under the EUDR, since only *deforestation* after 31 Dec 2020 does.
 It is reported separately: `touches_forest`, `forest_ha` and `point_colour`.
