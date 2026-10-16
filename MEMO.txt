@@ -1,0 +1,34 @@
+FAST, FAITHFUL EUDR CHECKS FOR RUBBER PLOTS
+Team hacknhire (NTU) · SystemEarth Hack & Hire · 16 October 2026
+
+
+WHAT WE BUILT
+
+Rubber is one of the seven commodities covered by the EU Deforestation Regulation (EUDR). A rubber plot can supply the EU only if its land was not forest on 31 December 2020, or that forest has not been cleared since. Rubber makes this hard to check from space: plantations look like forest, and replanting looks like clearing.
+
+We built a system that checks rubber plots against about 20 satellite layers in milliseconds, and gives exactly the answers the full layers give. We tested it on Jambi, Sumatra, one of Indonesia's main rubber regions (36 million pixels at 10 m).
+
+
+HOW IT WORKS
+
+- We keep only what the EUDR decision needs: forest on the cut-off date (JRC GFC2020), the rubber map, and the year each satellite source records a clearing after 2020 (JRC TMF, Hansen, RADD radar). Yearly maps become a single "first clearing year". Alert days and layers the rule never reads are dropped.
+- We treat rubber the way the EUDR does. Rubber plantations count as farmland, not forest (Art. 2(6)). So clearing on rubber land is flagged for review as likely replanting, not failed as deforestation. Deforestation is confirmed only when two independent sources agree.
+- We pack it per pixel. All 17 facts fit in one 32-bit number per pixel. These are stored in Neon (cloud PostgreSQL) as compressed pages. Checking any number of plots takes one database query, and the answers come from the same rule code that built the map.
+- Tools: Python, Neon PostgreSQL with PostGIS, and a PyQt5 map app. Claude helped us write and review code; no AI makes any compliance decision.
+
+
+RESULTS (Jambi, 1,000 test plots)
+
+- Decision fidelity: 100%. Every plot gets the same 35 outputs as from the original layers: verdict, reason, hectares and clearing years.
+- Pixel fidelity: 100% of the 36 million pixels in the decision map. The only data lost is what the decision never uses (alert days, yearly land-cover classes).
+- Storage: 6.7 MB in Neon, against 245.9 MB of raw layers (36x smaller) or 13.7 MB compressed (2x smaller).
+- Speed: 1,000 plots in 3.5 s over Neon, in one query. On local disk, 1.1 ms per plot against 10.9 ms from the original layers (about 10x faster).
+- Cost: about $0.10-0.16 a month to store evidence for all of Indonesia on S3.
+
+
+LIMITATIONS AND NEXT STEPS
+
+- The storage gain is modest against compressed originals (2x). The bigger win is the work each check saves.
+- Fidelity is not accuracy. 100% means nothing was lost, not that the rule is right. We agree on all 5 of the organiser's field-verified plots. Next: a larger accuracy check against field data.
+- The evidence keeps only what this rule needs, so a new rule means a rebuild. Next: archive the original layers alongside it.
+- Scope. We have tested one region, and social risks such as indigenous land rights and legality aren't covered yet. Next: scale to all of Indonesia's rubber areas, and cache each farm's answer until its map tile changes.
