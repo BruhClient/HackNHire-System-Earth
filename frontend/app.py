@@ -362,8 +362,8 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         self.basemap_anchor = tb.addWidget(QLabel("Basemap"))  # layer controls go before this
         basemap = QComboBox()
-        basemap.addItem("Streets", "streets")
         basemap.addItem("Satellite", "satellite")
+        basemap.addItem("Streets", "streets")
         basemap.currentIndexChanged.connect(lambda i: self.js(f"setBasemap('{basemap.itemData(i)}')"))
         tb.addWidget(basemap)
 

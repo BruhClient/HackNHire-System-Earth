@@ -37,7 +37,7 @@ var basemaps = {
     maxZoom: 19, attribution: 'Tiles &copy; Esri'
   })
 };
-var basemap = basemaps.streets.addTo(map);
+var basemap = basemaps.satellite.addTo(map);
 function setBasemap(name) {
   map.removeLayer(basemap);
   basemap = basemaps[name].addTo(map);
