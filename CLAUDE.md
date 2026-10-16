@@ -54,6 +54,7 @@ Stencils and outlines store the outcome in 5 colours. They give the same verdict
 frontend\.venv\Scripts\python frontend\app.py                                      # the app
 frontend\.venv\Scripts\python -m unittest discover -s frontend/tests -t frontend   # frontend tests (they use backend modules too)
 cd backend; venv\Scripts\python -m unittest discover -s tests -t .; cd ..          # backend tests (no database)
+backend\venv\Scripts\python backend\database\maps.py init                          # once, on a fresh database (tables: backend\database\schema.sql)
 backend\venv\Scripts\python backend\database\maps.py list                          # the maps stored in Neon
 cd backend; venv\Scripts\python pipeline.py --name NAME --data-dir LAYERS --bbox XMIN YMIN XMAX YMAX --test-plots 1000 --verify; cd ..
 cd backend; venv\Scripts\python compare\compare.py NAME --map NAME; cd ..          # the evaluation of a built map

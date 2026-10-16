@@ -2,11 +2,13 @@
 compare.py - the evaluation: what Neon answers vs the original data, on the same plots.
 
 Part 1, the 5 colours: stencils and outlines vs the TIFF they were built from.
-  Question 1  "Is the point in forest?"          - every point farm
-  Question 2  "Does the outline overlap forest?" - every outline farm
+  Question 1  "Is the point in forest of 31 Dec 2020?"          - every point farm
+  Question 2  "Does the outline overlap forest of 31 Dec 2020?" - every outline farm
+  (Forest on the EUDR cut-off date: forest, deforestation and needs review in the 5 colours,
+  common.FOREST_2020. Forest still standing today is reported too.)
   For each one, every method reports
-    * decision fidelity - % of farms whose answers match the TIFF exactly (in forest? / overlaps
-                          forest?, every colour touched, the EUDR verdict)
+    * decision fidelity - % of farms whose answers match the TIFF exactly (in 2020 forest? /
+                          overlaps it?, every colour touched, the EUDR verdict)
     * query speed       - all farms in one go, per farm, and one farm checked on its own
   Each approach is compared with the TIFF using the SAME rule, so only the storage differs:
     stencils  <->  TIFF counted in pixels   (--rule touched|centre)
@@ -71,12 +73,17 @@ def run_one_by_one(check, farms: list, sample: int) -> float:
     return statistics.median(check([farm])[1]["total_s"] for farm in picks)
 
 
-def share(approach: list, reference: list, test) -> str:
+def share(approach: list | None, reference: list, test) -> str:
+    """The share of farms where approach gives the same answer as reference ('-': not stored)."""
+    if approach is None:
+        return f"{'-':>10s}"
     same = sum(test(a) == test(r) for a, r in zip(approach, reference))
     return f"{100 * same / len(reference):9.2f}%"
 
 
-def print_mismatches(name: str, approach: list, reference: list) -> None:
+def print_mismatches(name: str, approach: list | None, reference: list) -> None:
+    if approach is None:
+        return
     bad = [(a, r) for a, r in zip(approach, reference) if a.key() != r.key()]
     for a, r in bad[:10]:
         print(f"    mismatch ({name}) {a.plot_id}: {a.verdict} [{a.colours_text()}] "
@@ -97,7 +104,7 @@ def map_bounds_text(grid: common.Grid) -> str:
 # --point: test single points typed on the command line
 # --------------------------------------------------------------------------------------
 def test_points(points, grid, methods, repeat: int) -> None:
-    print("\n=== Your points: \"is the point in forest?\" ===")
+    print("\n=== Your points: \"is the point in forest of 31 Dec 2020?\" ===")
     farms = common.farms_from_points(points, grid)
     for farm in farms:
         print(f"  {farm.plot_id[len('point '):]}  (longitude, latitude)")
@@ -110,7 +117,7 @@ def test_points(points, grid, methods, repeat: int) -> None:
             if result.outside:
                 answer = f"{'-':14s} {'outside the map':18s}"
             else:
-                answer = f"{common.CLASS_NAMES[result.point_colour]:14s} in forest: {YES_NO[result.touches_forest]:4s}   "
+                answer = f"{common.CLASS_NAMES[result.point_colour]:14s} 2020 forest: {YES_NO[result.in_forest_2020]:4s}"
             note = ""
             if reference is None:
                 reference = result
@@ -141,10 +148,10 @@ def label_line(timings: dict, n: int, what: str) -> None:
 
 
 def question_1(farms, idx, methods, args) -> dict:
-    """Point farms: the colour under the point, so: is the point in forest?"""
+    """Point farms: the colour under the point, so: is the point in forest of 31 Dec 2020?"""
     group = [farms[i] for i in idx]
     n = len(group)
-    print(f"\n=== Question 1: \"Is the point in forest?\" - {n} point farm{'' if n == 1 else 's'} ===")
+    print(f"\n=== Question 1: \"Is the point in forest of 31 Dec 2020?\" - {n} point farm{'' if n == 1 else 's'} ===")
     out, rows = {}, []
     for key, name, check in methods:
         if key == "tiff_ex":  # for a point, exact area and the pixel rule are the same thing
@@ -153,13 +160,17 @@ def question_1(farms, idx, methods, args) -> dict:
         rows.append((name, seconds, run_one_by_one(check, group, args.single)))
         out[key] = (results, timings)
     out["tiff_ex"] = out["tiff_px"]
-    tiff, sten, poly = out["tiff_px"][0], out["stencils"][0], out["polygons"][0]
-    in_forest = sum(r.touches_forest for r in tiff)
+    tiff, sten = out["tiff_px"][0], out["stencils"][0]
+    poly = out["polygons"][0] if "polygons" in out else None   # None: the map has no outlines
+    in_forest = sum(r.in_forest_2020 for r in tiff)
+    standing = sum(r.touches_forest for r in tiff)
     outside = sum(r.outside for r in tiff)
-    answers = f"  Answers from the original TIFF: {in_forest} in forest, {n - in_forest - outside} not in forest"
+    answers = (f"  Answers from the original TIFF: {in_forest} in 2020 forest ({standing} of them still standing), "
+               f"{n - in_forest - outside} not")
     print(answers + (f", {outside} outside the map" if outside else ""))
     print(f"\n  {'Same answer as the TIFF':38s}{'stencils':>10s}{'polygons':>10s}")
-    for label, test in (("In forest? (yes/no)", lambda r: r.touches_forest),
+    for label, test in (("In 2020 forest? (yes/no)", lambda r: r.in_forest_2020),
+                        ("In forest standing today? (yes/no)", lambda r: r.touches_forest),
                         ("Colour under the point", lambda r: r.point_colour),
                         ("EUDR verdict", lambda r: r.verdict),
                         ("Everything (decision fidelity)", lambda r: r.key())):
@@ -167,28 +178,31 @@ def question_1(farms, idx, methods, args) -> dict:
     print_mismatches("stencils", sten, tiff)
     print_mismatches("polygons", poly, tiff)
     speed_table(rows, n, "point")
-    label_line(out["polygons"][1], n, "points")
+    if poly is not None:
+        label_line(out["polygons"][1], n, "points")
     return out
 
 
 def question_2(farms, idx, methods, args) -> dict:
-    """Outline farms: every colour inside the outline, so: does it overlap forest?"""
+    """Outline farms: every colour inside the outline, so: does it overlap forest of 31 Dec 2020?"""
     group = [farms[i] for i in idx]
     n = len(group)
-    print(f"\n=== Question 2: \"Does the outline overlap forest?\" - {n} outline farm{'' if n == 1 else 's'} ===")
+    print(f"\n=== Question 2: \"Does the outline overlap forest of 31 Dec 2020?\" - {n} outline farm{'' if n == 1 else 's'} ===")
     out, rows = {}, []
     for key, name, check in methods:
         results, seconds, timings = run_batch(check, group, args.repeat)
         rows.append((name, seconds, run_one_by_one(check, group, args.single)))
         out[key] = (results, timings)
     tiff_px, tiff_ex = out["tiff_px"][0], out["tiff_ex"][0]
-    sten, poly = out["stencils"][0], out["polygons"][0]
-    exact = sum(r.touches_forest for r in tiff_ex)
-    pixel = sum(r.touches_forest for r in tiff_px)
-    print(f"  Answers from the original TIFF: {exact} of {n} overlap forest (exact area)"
+    sten = out["stencils"][0]
+    poly = out["polygons"][0] if "polygons" in out else None   # None: the map has no outlines
+    exact = sum(r.in_forest_2020 for r in tiff_ex)
+    pixel = sum(r.in_forest_2020 for r in tiff_px)
+    print(f"  Answers from the original TIFF: {exact} of {n} overlap 2020 forest (exact area)"
           + ("" if pixel == exact else f", {pixel} with the pixel rule"))
     print(f"\n  {'Same answer as the TIFF':38s}{'stencils':>10s}{'polygons':>10s}")
-    for label, test in (("Overlaps forest? (yes/no)", lambda r: r.touches_forest),
+    for label, test in (("Overlaps 2020 forest? (yes/no)", lambda r: r.in_forest_2020),
+                        ("Overlaps forest standing today?", lambda r: r.touches_forest),
                         ("Every colour touched", lambda r: r.present),
                         ("EUDR verdict", lambda r: r.verdict),
                         ("Everything (decision fidelity)", lambda r: r.key())):
@@ -200,7 +214,8 @@ def question_2(farms, idx, methods, args) -> dict:
           f"   those two rules themselves give different answers for {rule_diff} outline(s) - a policy\n"
           f"   choice about the rule, not a storage error)")
     speed_table(rows, n, "outline")
-    label_line(out["polygons"][1], n, "outlines")
+    if poly is not None:
+        label_line(out["polygons"][1], n, "outlines")
     return out
 
 
@@ -228,18 +243,20 @@ def test_geojson(conn, grid, args, methods, tif_info, show_storage: bool = True)
             for i, res in zip(idx, results):
                 merged[key][i] = res
     tiff_px, tiff_ex = merged["tiff_px"], merged["tiff_ex"]
-    sten, poly = merged["stencils"], merged["polygons"]
+    sten, poly = merged["stencils"], merged.get("polygons")   # poly None: the map has no outlines
+    modules = [("stencils", stencil_approach)] + ([("polygons", polygon_approach)] if poly else [])
 
     print(f"\n=== All {n} farms: decision fidelity (every answer matches the TIFF) ===")
     print(f"    stencils {share(sten, tiff_px, lambda r: r.key()).strip()}    "
           f"polygons {share(poly, tiff_ex, lambda r: r.key()).strip()}")
     for results, method in ((tiff_px, "tiff-pixel"), (tiff_ex, "tiff-exact"),
                             (sten, stencil_approach.METHOD), (poly, polygon_approach.METHOD)):
-        common.save_results(conn, grid, farms, results, method)
+        if results is not None:
+            common.save_results(conn, grid, farms, results, method)
 
     if not args.skip_verify:
         print("\n=== Pixel fidelity (rebuild the whole map from the database) ===")
-        for name, module in (("stencils", stencil_approach), ("polygons", polygon_approach)):
+        for name, module in modules:
             stats = module.verify(conn, grid, args.tif)
             print(f"  {name:9s} {stats['mismatched']:,} of {stats['pixels']:,} pixels differ  "
                   f"-> {common.fidelity_text(stats)} (all colours, including land and forest)")
@@ -250,7 +267,7 @@ def test_geojson(conn, grid, args, methods, tif_info, show_storage: bool = True)
         print(f"  original TIFF file (compressed)     {file_bytes / 1e6:8.3f} MB")
         print(f"  original TIFF, uncompressed pixels  {raw_bytes / 1e6:8.3f} MB")
         shared_bytes = sum(s for s, _ in common.table_sizes(conn, [grid.table("grid_info")]).values())
-        for name, module in (("stencils", stencil_approach), ("polygons", polygon_approach)):
+        for name, module in modules:
             sizes = common.table_sizes(conn, [grid.table(t) for t in module.TABLES])
             total = sum(s for s, _ in sizes.values()) + shared_bytes
             detail = ", ".join(f"{t.rsplit('.', 1)[-1]}: {r:,} rows" for t, (s, r) in sizes.items())
@@ -267,14 +284,14 @@ def test_geojson(conn, grid, args, methods, tif_info, show_storage: bool = True)
                     "forest_tiff_pixel", "forest_stencils", "forest_tiff_exact", "forest_polygons",
                     "colours_tiff_pixel", "colours_stencils", "colours_tiff_exact", "colours_polygons",
                     "forest_ha_tiff_exact", "forest_ha_polygons", "note"])
-        for tp, st, te, po in zip(tiff_px, sten, tiff_ex, poly):
+        for tp, st, te, po in zip(tiff_px, sten, tiff_ex, poly or [None] * n):
             w.writerow([tp.plot_id, tp.kind,
                         tp.verdict, st.verdict, st.key() == tp.key(),
-                        te.verdict, po.verdict, po.key() == te.key(),
-                        *(common.CLASS_NAMES.get(r.point_colour, "") for r in (tp, st, po)),
-                        *(YES_NO[r.touches_forest] for r in (tp, st, te, po)),
-                        tp.colours_text(), st.colours_text(), te.colours_text(), po.colours_text(),
-                        f"{te.ha(common.FOREST):.4f}", f"{po.ha(common.FOREST):.4f}", tp.note])
+                        te.verdict, po.verdict if po else "", po.key() == te.key() if po else "",
+                        *(common.CLASS_NAMES.get(r.point_colour, "") if r else "" for r in (tp, st, po)),
+                        *(YES_NO[r.touches_forest] if r else "" for r in (tp, st, te, po)),
+                        tp.colours_text(), st.colours_text(), te.colours_text(), po.colours_text() if po else "",
+                        f"{te.ha(common.FOREST):.4f}", f"{po.ha(common.FOREST):.4f}" if po else "", tp.note])
     print(f"\nWrote {common.nice_path(args.csv)} (one row per farm)")
 
 
@@ -316,6 +333,20 @@ def evidence_fidelity(rows: list[dict], reference: list[dict]) -> dict:
             "same_verdict": sum(r["verdict"] == e["verdict"] for r, e in zip(rows, reference)), "differ": differ}
 
 
+def two_step_fidelity(rows: list[dict], reference: list[dict]) -> dict:
+    """Like evidence_fidelity, for the two-step check: every output it gives must match. The figures a
+    screened plot leaves empty (evidence_approach.SCREEN_UNKNOWN) aren't compared; they are counted."""
+    differ, empty = [], 0
+    for r, e in zip(rows, reference):
+        given = {k: v for k, v in r.items() if v is not None and k != "in_forest_2020"}
+        empty += sum(1 for v in r.values() if v is None)
+        outputs = eudr_layers.compare_outputs(given, {k: e.get(k) for k in given})
+        if outputs:
+            differ.append((r["plot_id"], outputs))
+    return {"plots": len(rows), "identical": len(rows) - len(differ), "empty": empty,
+            "same_verdict": sum(r["verdict"] == e["verdict"] for r, e in zip(rows, reference)), "differ": differ}
+
+
 def one_plot_at_a_time(check, plots, sample: int) -> float:
     """Median seconds to check ONE plot on its own (plots: a GeoDataFrame)."""
     picks = [plots.iloc[[i]] for i in range(0, len(plots), max(1, len(plots) // sample))][:sample]
@@ -344,21 +375,37 @@ def evidence_part(conn, grid, folder: str, plots_path: str, args) -> None:
     def from_neon(p):
         return evidence_approach.check(conn, grid, p, args.min_plot_ha)
 
+    def from_neon_two_step(p):
+        return evidence_approach.check(conn, grid, p, args.min_plot_ha, two_step=True)
+
     print(f"  {n} plots, as eudr_layers.py reads them (a point is a circle of its declared area, 4 ha if none);"
           f"\n  each way checks them {args.repeat} times and the median is reported.")
     neon_rows, neon_s, timings = run_batch(from_neon, plots, args.repeat)
+    two_rows, two_s, two_timings = run_batch(from_neon_two_step, plots, args.repeat)
     file_rows, file_s, _ = run_batch(from_file, plots, args.repeat)
     singles = {"neon": one_plot_at_a_time(from_neon, plots, args.single),
+               "two_step": one_plot_at_a_time(from_neon_two_step, plots, args.single),
                "file": one_plot_at_a_time(from_file, plots, args.single)}
     conn.rollback()                                # the checks only read: end the transaction
 
     fid = evidence_fidelity(neon_rows, file_rows)
+    two = two_step_fidelity(two_rows, file_rows)
+    in_2020 = sum(1 for r in two_rows if r.get("in_forest_2020"))
+    print(f"\n  The two key questions, forest on 31 Dec 2020 (from the stencils): {in_2020:,} of {n:,} plots "
+          f"touch it, {n - in_2020:,} don't")
     summary = layers.summary(folder) or {}
     joe = summary.get("fidelity") or {}
     outputs = len(neon_rows[0]) - 1 if neon_rows else 0
     print(f"\n  Decision fidelity ({outputs} outputs a plot: verdict, reason, every hectare figure, the years)")
     print(f"    Neon vs evidence.tif              {fid['identical']:,} of {fid['plots']:,} plots identical "
           f"({100 * fid['identical'] / max(n, 1):.2f}%); same verdict {100 * fid['same_verdict'] / max(n, 1):.2f}%")
+    print(f"    Neon two steps vs evidence.tif    {two['identical']:,} of {two['plots']:,} plots identical in every "
+          f"output given ({100 * two['identical'] / max(n, 1):.2f}%); same verdict "
+          f"{100 * two['same_verdict'] / max(n, 1):.2f}%\n"
+          f"      ({two_timings['screened']:,} plots on no 2020 forest were settled from the stencils, leaving "
+          f"{two['empty']:,} figures empty in all)")
+    for pid, differ in two["differ"][:10]:
+        print(f"    two-step mismatch {pid}: {', '.join(differ)}")
     if joe.get("plots_compared"):
         print(f"    evidence.tif vs original layers   {joe['plots_with_every_output_identical']:,} of "
               f"{joe['plots_compared']:,} plots identical ({joe['decision_fidelity_pct']}%); same verdict "
@@ -372,13 +419,17 @@ def evidence_part(conn, grid, folder: str, plots_path: str, args) -> None:
 
     print(f"\n  {'Speed':34s}{f'all {n} at once':>16s}{'per plot':>12s}{'one plot alone':>17s}")
     for name, seconds, single in (("evidence.tif on disk (local)", file_s, singles["file"]),
-                                  ("Neon evidence pages (over Neon)", neon_s, singles["neon"])):
+                                  ("Neon evidence pages (over Neon)", neon_s, singles["neon"]),
+                                  ("Neon, two steps (over Neon)", two_s, singles["two_step"])):
         print(f"    {name:32s}{seconds:14.3f} s{1000 * seconds / max(n, 1):9.2f} ms{1000 * single:14.2f} ms")
     if joe.get("query_ms_median"):
         files = (joe.get("files_read_per_plot") or {}).get("original_layers")
         print(f"    {'original layers (local, --verify)':32s}{'':16s}{joe['query_ms_median']['original_layers']:9.2f} ms"
               f"   median, {files} files a plot")
-    print(f"  (Neon: 3 round trips per batch - tables there?, the rule, the pages; {timings['pages']} pages fetched)")
+    print(f"  (Neon: 1 round trip per batch - the pages ({timings['pages']} fetched); the map's tables come with "
+          f"its grid and evidence_info is read once per map."
+          f"\n   Two steps: 2 - the stencil pages ({two_timings['stencil_pages']}), then the evidence pages "
+          f"({two_timings['pages']}) of the plots on 2020 forest. No extra storage: the stencils are stored anyway.)")
 
     print("\n  Pixel fidelity")
     if not args.skip_verify:
@@ -433,10 +484,11 @@ def main() -> None:
     ap.add_argument("--map", help="which stored map to compare with (needed when there are several)")
     ap.add_argument("--point", nargs=2, type=float, action="append", metavar=("LON", "LAT"),
                     help="test one point: longitude first, then latitude (repeat for more points)")
-    ap.add_argument("--rule", choices=["touched", "centre"], default="touched",
-                    help="pixel rule for the stencils and the pixel baseline (default touched)")
+    ap.add_argument("--rule", choices=["centre", "touched"], default="centre",
+                    help="pixel rule for the stencils and the pixel baseline (default centre, as eudr_layers.py)")
     ap.add_argument("--point-mode", choices=["pixel", "circle"], default="pixel",
-                    help="GeoJSON points: the pixel under the point, or a circle of the declared area")
+                    help="GeoJSON points: the pixel under the point (default), or a circle of the declared "
+                         "area (4 ha if none, as eudr_layers.py)")
     ap.add_argument("--repeat", type=int, default=3, help="timing runs per method (median is reported)")
     ap.add_argument("--single", type=int, default=20,
                     help="how many farms to also time one at a time (default 20)")
@@ -471,8 +523,10 @@ def main() -> None:
     with common.connect() as conn:
         conn.execute("SELECT 1")  # wake Neon up before timing anything
         grid = common.load_grid(conn, args.map)
-        polygon_approach.ensure_built(conn, grid)
         stencil_approach.ensure_built(conn, grid)
+        has_outlines = common.has_tables(conn, grid, *polygon_approach.TABLES)
+        if not has_outlines:
+            print("This map was uploaded without outlines (--no-outlines): only the stencils are compared.")
         with rasterio.open(args.tif) as src:
             tif_grid = common.same_grid_or_exit(src, grid)
             tif_info = (os.path.getsize(args.tif), src.width * src.height * np.dtype(src.dtypes[0]).itemsize)
@@ -487,10 +541,11 @@ def main() -> None:
             ("tiff_px", f"TIFF, {pixel_rule}", lambda fs: common.check_with_tiff(args.tif, grid, fs, "pixel", all_touched)),
             ("tiff_ex", "TIFF, exact area", lambda fs: common.check_with_tiff(args.tif, grid, fs, "exact")),
             ("stencils", "stencils", lambda fs: stencil_approach.check(conn, grid, fs, all_touched)),
-            ("polygons", "polygons", lambda fs: polygon_approach.check(conn, grid, fs)),
         ]
+        if has_outlines:
+            methods.append(("polygons", "polygons", lambda fs: polygon_approach.check(conn, grid, fs)))
         if args.point:
-            point_methods = [("original TIFF", methods[0][2]), ("stencils", methods[2][2]), ("polygons", methods[3][2])]
+            point_methods = [("original TIFF", methods[0][2])] + [(name, check) for _, name, check in methods[2:]]
             test_points(args.point, grid, point_methods, args.repeat)
             conn.rollback()  # test points are not saved
         if args.plots:

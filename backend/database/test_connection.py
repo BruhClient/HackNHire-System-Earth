@@ -20,7 +20,7 @@ def main() -> None:
             print(f"  Connected to database '{database}' as '{user}'")
             print(f"  {version.split(',')[0]}")
             try:
-                cur.execute("CREATE EXTENSION IF NOT EXISTS postgis")
+                cur.execute(common.schema_sql("postgis"))
                 cur.execute("SELECT postgis_lib_version()")
                 print(f"  PostGIS {cur.fetchone()[0]} is switched on (polygon_approach.py needs it)")
             except Exception as exc:  # noqa: BLE001 - show any problem in plain words

@@ -188,7 +188,8 @@ function labelFor(layer) {
   if (!v) return esc(p.name);
   if (v.stale) return esc(p.name) + ' · edited';
   var s = CONFIG.verdicts[v.verdict];
-  return esc(p.name) + ' · ' + s.icon + ' ' + esc(s.headline);
+  var why = (v.verdict === 'FAIL' || v.verdict === 'PASS') ? '' : ' (' + esc(s.detail) + ')';
+  return esc(p.name) + ' · ' + s.icon + ' ' + esc(s.headline) + why;
 }
 
 function addFarmLayer(layer, name, extra) {

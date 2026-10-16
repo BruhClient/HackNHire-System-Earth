@@ -47,6 +47,9 @@ def parse(argv=None):
     ap.add_argument("--out-dir", help="folder for the compact layers (default: layers/<name>)")
     ap.add_argument("--skip-build", action="store_true", help="use the compact layers already in the folder")
     ap.add_argument("--no-upload", action="store_true", help="stop after building the compact layers")
+    ap.add_argument("--no-outlines", action="store_true",
+                    help="upload without the outlines (~24x less storage; the app's stencils-vs-outlines "
+                         "comparison then can't run on this map)")
     args, rest = ap.parse_known_args(argv)
     seen = argparse.ArgumentParser(add_help=False)   # options eudr_layers.py also uses in step 3
     seen.add_argument("--plots")
@@ -104,7 +107,7 @@ def main(argv=None) -> int:
 
     print(f"\nStep 2 of 3: uploading {common.nice_path(out)} to Neon as '{name}'")
     with common.connect() as conn:
-        maps.upload(conn, out, name)
+        maps.upload(conn, out, name, outlines=not args.no_outlines)
 
     test_plots = os.path.join(out, "test_plots.geojson")
     plot_files = ([args.plots] if args.plots else []) + ([test_plots] if os.path.isfile(test_plots) else [])

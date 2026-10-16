@@ -16,6 +16,12 @@ Three things keep the checks fast:
     more round trip to Neon, which costs more than they save on a few farms.
   * Before a big query, PostgreSQL's JIT compiler is switched off: it spent ~150 ms compiling
     the overlap query, which then ran in ~65 ms (see common.no_jit).
+  * Points and outlines are answered in one query, and an outline that covers a whole farm is
+    measured without cutting it (ST_Covers): the overlap is simply the farm.
+
+Outlines are an alternative kept for the evaluation: they take ~24x the stencils' storage for the
+same 5 colours and measure exact areas (a different rule from eudr_layers.py's pixel centres).
+maps.py upload --no-outlines leaves them out.
 
 The colours are the compaction step's outcome in 5 colours (layers/<map>/outcome_5class.tif, see
 layers.py), or any TIFF in the 5 colours.
@@ -26,7 +32,7 @@ Commands (run from the backend folder; give a path, or a path inside layers/)
     python database/polygon_approach.py verify jambi/outcome_5class.tif [--map NAME]
 (To upload a new map with every approach at once, use database/maps.py upload.)
 
-Tables (in the map's own schema, next to the shared ones in common.py)
+Tables (in the map's own schema; defined in schema.sql, sections @outlines and @outlines_keys)
     class_polys     one row per outline: its colour and its shape (with a spatial index)
     square_labels   one row per 256 x 256 page: the colour of each 16 x 16 square (255 = mixed), zipped
 """
@@ -83,11 +89,11 @@ def square_labels(data: np.ndarray) -> np.ndarray:
 
 
 def ensure_built(conn, grid: common.Grid) -> None:
-    if not (common.table_exists(conn, grid.table("class_polys"))
-            and common.table_exists(conn, grid.table("square_labels"))):
-        raise SystemExit(f"The map '{grid.map_version}' has no outlines yet (or they were made by an older "
-                         "version). Build them first:\n"
-                         f"  python database/polygon_approach.py build jambi/outcome_5class.tif --map \"{grid.map_version}\"")
+    if not common.has_tables(conn, grid, "class_polys", "square_labels"):
+        raise SystemExit(f"The map '{grid.map_version}' has no outlines (it was uploaded with --no-outlines, "
+                         "or by an older version). Build them for it:\n"
+                         f"  python database/polygon_approach.py build jambi/outcome_5class.tif --map \"{grid.map_version}\"\n"
+                         "or upload the map again without --no-outlines.")
 
 
 # --------------------------------------------------------------------------------------
@@ -103,21 +109,11 @@ def build(conn, tif: str, map_name: str, report=None, tidy: bool = True) -> comm
         stored = common.stored_colours(grid, counts)
         polys, labels_table = grid.table("class_polys"), grid.table("square_labels")
         with conn.cursor() as cur:
-            # PostGIS lives in public, so deleting a map's schema can never remove it
-            cur.execute("CREATE EXTENSION IF NOT EXISTS postgis SCHEMA public")
+            # PostGIS lives in public, so deleting a map's schema can never remove it (maps.py init
+            # sets it up; this makes sure, for a database set up before)
+            cur.execute(common.schema_sql("postgis"))
             cur.execute(f"DROP TABLE IF EXISTS {polys}, {labels_table}")
-            cur.execute(f"""
-                CREATE TABLE {polys} (
-                    class_id  SMALLINT NOT NULL,   -- 0 land, 1 water, 2 forest, 3 deforestation,
-                                                   -- 4 needs review, 5 no data
-                    geom      geometry(Polygon, {grid.srid}) NOT NULL
-                )""")
-            cur.execute(f"""
-                CREATE TABLE {labels_table} (
-                    page_col  INT NOT NULL,
-                    page_row  INT NOT NULL,
-                    labels    BYTEA NOT NULL      -- colour of each 16 x 16 square (255 = mixed), zipped
-                )""")
+            cur.execute(common.schema_sql("outlines", grid))    # schema.sql: the two tables
 
         rows, labels = [], []
         progress = common.Progress(common.page_count(src), "tracing outlines", report)
@@ -140,8 +136,7 @@ def build(conn, tif: str, map_name: str, report=None, tidy: bool = True) -> comm
         if report is not None:
             report("building the indexes", 0, 1)
         with conn.cursor() as cur:
-            cur.execute(f"CREATE INDEX class_polys_geom_idx ON {polys} USING GIST (geom)")
-            cur.execute(f"ALTER TABLE {labels_table} ADD PRIMARY KEY (page_row, page_col)")
+            cur.execute(common.schema_sql("outlines_keys", grid))
         if report is not None:
             report("building the indexes", 1, 1)  # last report before the commit: a Cancel still undoes it all
     if tidy:
@@ -194,7 +189,7 @@ def uniform_colour(pages: dict, span: tuple) -> int | None:
 def check(conn, grid: common.Grid, farms: list[common.Farm]):
     """Returns (results, timings). Every answer is exact; the labels only skip geometry work
     for farms that sit entirely in one colour (checked: identical answers).
-    Round trips to the database: one per kind of farm (points, outlines), plus one for the
+    Round trips to the database: one for the points and outlines together, plus one for the
     labels in a big batch, and one to switch JIT off before a big query."""
     ensure_built(conn, grid)
     t0 = time.perf_counter()
@@ -229,6 +224,8 @@ def check(conn, grid: common.Grid, farms: list[common.Farm]):
 
         if len(outlines) >= JIT_OFF_OUTLINES or len(points) >= JIT_OFF_POINTS:
             common.no_jit(cur)  # a big query: PostgreSQL's JIT compiler would waste up to ~150 ms on it
+        # Points and outlines go in ONE query (one round trip), as two parts joined by UNION ALL.
+        parts, params = [], []
         if points:
             # 2. "Is the point in forest?" - which outline holds the point. The centre of the
             #    pixel under the point is used, so a point on a pixel edge never matches two.
@@ -237,26 +234,32 @@ def check(conn, grid: common.Grid, farms: list[common.Farm]):
                 x, y = grid.pixel_centre(*grid.point_to_pixel(farms[i].geom.x, farms[i].geom.y))
                 xs.append(x)
                 ys.append(y)
-            cur.execute(f"""
-                SELECT q.idx, r.class_id
+            parts.append(f"""
+                SELECT 0 AS part, q.idx, r.class_id, 0::float8 AS m2
                 FROM unnest(%s::int[], %s::float8[], %s::float8[]) AS q(idx, x, y)
-                JOIN {grid.table("class_polys")} r ON ST_Intersects(r.geom, ST_SetSRID(ST_MakePoint(q.x, q.y), {grid.srid}))
-                """, (points, xs, ys))
-            colour_at = dict(cur.fetchall())
+                JOIN {grid.table("class_polys")} r ON ST_Intersects(r.geom, ST_SetSRID(ST_MakePoint(q.x, q.y), {grid.srid}))""")
+            params += [points, xs, ys]
         if outlines:
             # 3. "Does the outline overlap forest?" - how much of each colour lies inside each farm.
             #    The spatial index finds the few outlines near each farm; only those are measured.
-            area = ("ST_Area(ST_Intersection(r.geom, f.geom)::geography)" if grid.geographic
-                    else "ST_Area(ST_Intersection(r.geom, f.geom))")
-            cur.execute(f"""
-                SELECT f.idx, r.class_id, SUM({area})
+            #    An outline that covers the whole farm needs no intersection: the overlap is the farm.
+            geography = "::geography" if grid.geographic else ""
+            parts.append(f"""
+                SELECT 1 AS part, f.idx, r.class_id,
+                       SUM(CASE WHEN ST_Covers(r.geom, f.geom) THEN ST_Area(f.geom{geography})
+                                ELSE ST_Area(ST_Intersection(r.geom, f.geom){geography}) END) AS m2
                 FROM (SELECT q.idx, ST_GeomFromEWKB(q.g) AS geom
                       FROM unnest(%s::int[], %s::bytea[]) AS q(idx, g)) AS f
                 JOIN {grid.table("class_polys")} r ON ST_Intersects(r.geom, f.geom)
-                GROUP BY f.idx, r.class_id
-                """, (outlines, ewkb_many([farms[i].geom for i in outlines], grid.srid)))
-            for idx, colour, m2 in cur.fetchall():
-                overlaps[idx][colour] = m2
+                GROUP BY f.idx, r.class_id""")
+            params += [outlines, ewkb_many([farms[i].geom for i in outlines], grid.srid)]
+        if parts:
+            cur.execute(" UNION ALL ".join(f"({p})" for p in parts), params)
+            for part, idx, colour, m2 in cur.fetchall():
+                if part == 0:
+                    colour_at[idx] = colour
+                else:
+                    overlaps[idx][colour] = m2
 
     default = grid.default_class
     for i in points:

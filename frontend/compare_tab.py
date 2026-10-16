@@ -1,7 +1,7 @@
 """compare_tab.py - the Compare tab: a benchmark of the two approaches against Neon.
 
 Made-up farms (farmgen) in batches of 1, 10, 100 and 1,000 are checked by both approaches, one
-question at a time ("is the point in forest?", "does the outline overlap forest?"). Every run is
+question at a time ("is the point in forest of 31 Dec 2020?", "does the outline overlap it?"). Every run is
 its own transaction, rolled back, so nothing is written; each number is the median of 3 runs.
 The sentences under the charts are worked out from the numbers, never written in advance.
 """

@@ -7,6 +7,8 @@ Two palettes, on purpose:
 Verdicts use fixed status colours and always come with an icon and a label.
 """
 
+from backend import common
+
 LAND, WATER, FOREST, DEFORESTATION, REVIEW, NO_DATA = 0, 1, 2, 3, 4, 5  # as in common.py
 CLASSES = (LAND, WATER, FOREST, DEFORESTATION, REVIEW, NO_DATA)
 
@@ -30,12 +32,20 @@ METHODS = {  # key -> (label, chart colour)
 }
 
 VERDICT_ORDER = ("FAIL", "MANUAL_REVIEW", "CANNOT_CHECK", "CHECK_LOCATION", "PASS")  # worst first
-VERDICT_STYLE = {  # verdict -> (status colour, icon, headline)
-    "FAIL": ("#d03b3b", "✖", "Not compliant"),
-    "MANUAL_REVIEW": ("#ec835a", "⚠", "Needs review"),
-    "CANNOT_CHECK": ("#898781", "?", "Cannot check"),
-    "CHECK_LOCATION": ("#fab219", "⚠", "Check the location"),
-    "PASS": ("#0ca30c", "✔", "Compliant"),
+# A farm's result is one of three outcomes; which verdict leads to which is the backend's rule
+# (common.OUTCOME_OF). The verdict stays as the reason (VERDICT_DETAIL).
+OUTCOME_STYLE = {  # outcome -> (status colour, icon, headline)
+    "NON_COMPLIANT": ("#d03b3b", "✖", "Not compliant"),
+    "NEEDS_REVIEW": ("#ec835a", "⚠", "Needs review"),
+    "COMPLIANT": ("#0ca30c", "✔", "Compliant"),
+}
+VERDICT_STYLE = {v: OUTCOME_STYLE[common.outcome_of(v)] for v in VERDICT_ORDER}  # verdict -> its outcome's style
+VERDICT_DETAIL = {  # why, for the three ways to need review
+    "FAIL": "deforestation after 31 Dec 2020",
+    "MANUAL_REVIEW": "the map is unsure about clearing",
+    "CANNOT_CHECK": "no data or outside the map",
+    "CHECK_LOCATION": "on water: check the location",
+    "PASS": "no deforestation after 31 Dec 2020",
 }
 
 
@@ -52,6 +62,7 @@ def page_config():
         "chartOrder": list(CHART_ORDER),
         "problemClasses": list(PROBLEM_CLASSES),
         "methods": {key: {"label": label, "colour": colour} for key, (label, colour) in METHODS.items()},
-        "verdicts": {v: {"colour": c, "icon": i, "headline": h} for v, (c, i, h) in VERDICT_STYLE.items()},
+        "verdicts": {v: {"colour": c, "icon": i, "headline": h, "detail": VERDICT_DETAIL[v]}
+                     for v, (c, i, h) in VERDICT_STYLE.items()},
         "verdictOrder": list(VERDICT_ORDER),
     }

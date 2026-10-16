@@ -65,9 +65,12 @@ Each TIFF pixel holds one value:
 - A point takes the colour of the pixel it lands on.
 - Exact-area rule (outlines): a colour counts if its overlap is more than
   max(1e-4 m², 1e-6 × farm area).
-- Pixel rule (stencils): `touched` = the pixel overlaps the farm by some area, not just along an
-  edge; `centre` = the pixel's centre is inside. The stencils and the TIFF pixel baseline both use
-  `common.farm_pixels`, so they always look at the same pixels.
+- Pixel rule (stencils): `centre` (the default) = the pixel's centre is inside, rasterised with
+  `rasterio.features.geometry_mask` exactly as `eudr_layers.plot_mask` (a farm smaller than a pixel
+  gets every pixel it touches); `touched` = the pixel overlaps the farm by some area, not just along
+  an edge. The stencils and the TIFF pixel baseline both use `common.farm_pixels`, so they always
+  look at the same pixels. `--point-mode circle` makes a point a circle of its declared area (4 ha
+  if none), built as `eudr_layers.read_plots` builds it; the default checks the pixel under it.
 - Decision fidelity compares `PlotResult.key()` = (verdict, colours touched, point colour).
   Stencils are compared with the TIFF using the pixel rule, outlines using exact areas.
 
@@ -132,6 +135,7 @@ A change is done when:
 Show the commands and their output as evidence.
 
 ## Design invariants
+- **Every table is defined in `database/schema.sql`**, in sections (`-- @name`; `{schema}` and `{srid}` filled in by `common.schema_sql`). Never write `CREATE TABLE` / indexes in Python: add or change a section there. `maps.py init` makes the shared parts once (`@shared`: `public.maps`; `@postgis`); uploads stamp out a map's tables from the other sections.
 - **One schema per map.**
   - `common.map_schema(name)` gives the schema: `map_` + the lowercase name, with other characters becoming `_`.
   - `public.maps` is the catalogue (name, schema, source file, fingerprint, size).
@@ -149,7 +153,9 @@ Show the commands and their output as evidence.
   pixels, 255 = mixed, zipped per page) are used only for checks of at least `LABELS_FROM` (200)
   farms, and must never change an answer.
 - Farm areas come from pyproj (`common.area_m2`); the default colour's area is whatever remains.
-- Stencils: bit `r*8+c` of each square, little-endian `packbits`, 6 layers per page, zlib level 9.
+- Stencils: each page is its colour codes, one byte per pixel, raw LZMA2 (`stencil_approach.LZMA_FILTERS`: preset 9e, 64 KB dictionary), column `colours`. (The 8 × 8 64-bit bitmaps of the first version were measured 25% bigger on Jambi.)
+- Outlines are optional: `maps.upload(..., outlines=False)` / `--no-outlines`. Anything that runs the outlines checks `common.has_tables` first.
+- Grids from `load_grid` carry the map's tables (`Grid.tables`); `ensure_built` uses `common.has_tables`, so a check costs no extra round trip.
   Pages that are all the default colour get no row. `STORAGE MAIN` and `VACUUM ANALYZE` after
   upload.
 - **Evidence pages:**
@@ -157,7 +163,7 @@ Show the commands and their output as evidence.
     (`u1`, or `<u2` above 256 values).
   - Pages that are all `evidence_info.default_value` get no row. That value is the most common
     one; on a tie, the smallest.
-  - A check is 3 round trips: are the tables there?, `evidence_info`, the pages.
+  - A check is 1 round trip: the pages. The map's tables come with `load_grid` (`Grid.tables`, `common.has_tables`), and `evidence_info` is read once per map (`load_info`'s cache).
 - **`evidence_info`** keeps the bit layout and rule parameters. `check_layout` refuses evidence from
   another version.
 - **`evidence_results`** has no `map_version` column, so a rename doesn't need to touch it.
@@ -188,17 +194,19 @@ maps, `frontend\smoke_maps.py` (writes only a throwaway map).
   - `connect`, `load_grid(conn, name)`, `find_map`, `table_exists`, `scan_map`, `save_results`, `check_with_tiff`, `area_m2`
   - `map_schema`, `MAP_NAME_MAX`, `default_map_name`, `normalise`, `Progress(total, label, report)`
   - `farms_from_features`, `load_farms`, `farm_outside`, `point_result`, `exact_result`
-  - `TIFF_DIR`, `PAGE`, `COLOURS`, `VERDICTS`, the class constants
+  - `TIFF_DIR`, `PAGE`, `COLOURS`, `VERDICTS`, the class constants, `FOREST_2020` (forest on the cut-off date in the 5 colours: forest, deforestation, needs review)
   - `Grid`: its fields (`x0`, `y0`, `pixel_w`, `pixel_h`, `width`, `height`, `srid`, `default_class`, `fingerprint`, `map_version`, `schema`), plus `table()`, `point_to_pixel`, `pixel_centre`, `inside`, `bounds_box`, `from_dataset` and `==` (which ignores `schema`)
   - `Farm` (`plot_id`, `kind` = `point` / `outline`, `geom`)
-  - `PlotResult` (`verdict`, `present`, `point_colour`, `ha()`, `water_share`, `outside`, `note`, `key()`)
+  - `PlotResult` (`verdict`, `present`, `point_colour`, `ha()`, `water_share`, `outside`, `note`, `key()`, `outcome`, and the two key questions: `in_forest_2020`, `forest_2020_ha()`)
+  - `OUTCOMES`, `OUTCOME_OF`, `outcome_of(verdict)`: every verdict (both vocabularies) → `COMPLIANT`, `NON_COMPLIANT` or `NEEDS_REVIEW`. The app's verdict styles are built from it (`legend.VERDICT_STYLE`)
 - Both approaches:
   - `check(conn, grid, farms[, all_touched])` returns `(results in farm order, {"total_s": ...})`.
   - It must accept any connection-like object, because the frontend passes a `MeteredConnection` proxy to count queries.
   - It must only use `conn.cursor()` (as a context manager), `execute`, `fetchall` and `fetchone`.
   - It must also work when given only points or only outlines.
 - Both approaches: `ensure_built(conn, grid)`, `build(conn, tif, map_name, report=None, tidy=True)` (returns the `Grid`), `verify(conn, grid, tif)`.
-- `stencil_approach`: `page_size`, `unzip_page`, `to_pixels`, `pack_page`, `LAYERS`. The frontend rebuilds the whole map from `SELECT page_col, page_row, stencils FROM {grid.table('stencil_pages')}`, and pages with no row are `default_class`.
+- `stencil_approach`: `page_size`, `unzip_page` (→ the page's colours, height × width uint8), `pack_page`, `fetch_pages`. The frontend rebuilds the whole map from `SELECT page_col, page_row, colours FROM {grid.table('stencil_pages')}`, and pages with no row are `default_class`.
+- `maps.upload(conn, source, name, report, outlines=True)`; `common.has_tables`, `Grid.tables` (the frontend's `need_outlines` reads it).
 - `common.TIFF_DIR` (= `LAYERS_DIR`) plus `grid_info.source_file` is where the frontend looks for the reference TIFF.
 - The frontend's environment has no scipy or pandas. So `common`, `maps`, `stencil_approach` and `polygon_approach` must never import `layers`, `evidence_approach` or `eudr_layers` at module level. `maps.upload` imports them only for a results folder.
 

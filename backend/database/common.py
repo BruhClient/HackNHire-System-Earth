@@ -40,9 +40,10 @@ import shapely
 from affine import Affine
 from psycopg.types.json import Jsonb
 from pyproj import Geod, Transformer
-from rasterio.features import shapes
+from rasterio.features import geometry_mask, shapes
 from rasterio.windows import Window
-from shapely.geometry import Polygon, box, shape
+from shapely import affinity
+from shapely.geometry import Point, Polygon, box, shape
 from shapely.ops import transform as reproject
 
 # --------------------------------------------------------------------------------------
@@ -59,6 +60,13 @@ CLASS_NAMES = {
 }
 COLOURS = tuple(CLASS_NAMES)
 
+# Forest on the EUDR cut-off date (31 Dec 2020) in the 5 colours. The compaction step (layers.five_classes)
+# turns every pixel JRC GFC2020 calls forest into forest (still standing, damaged or rubber-map forest),
+# deforestation or needs review, and every pixel it doesn't into land, so these three colours are the
+# 2020 forest (minus pixels that are now water or have no data). Its rule only ever finds deforestation
+# on 2020 forest, so a farm touching none of them can't be deforestation, whatever else is under it.
+FOREST_2020 = (FOREST, DEFORESTATION, REVIEW)
+
 PAGE = 256  # the TIFF is read, and stencils are packed, in pages of 256 x 256 pixels
 
 # Overlap rules (exact-area mode): a colour counts as "touched" if it covers more than
@@ -73,6 +81,33 @@ CANNOT_CHECK = "CANNOT_CHECK"      # outside the map, or on no-data pixels
 CHECK_LOCATION = "CHECK_LOCATION"  # on water: coordinates are probably wrong
 PASS = "PASS"                      # only land and/or forest
 VERDICTS = (FAIL, MANUAL_REVIEW, CANNOT_CHECK, CHECK_LOCATION, PASS)
+
+# A plot's result has three outcomes. The verdicts above (and eudr_layers.plot_verdict's, for the
+# evidence) say why:
+#   red (deforestation)       -> non-compliant
+#   purple (needs review)     -> needs review
+#   green (forest) and land   -> compliant: standing forest isn't deforestation under the EUDR
+# A farm that can't be checked (no data, outside the map, on water) also needs review.
+NON_COMPLIANT, NEEDS_REVIEW, COMPLIANT = "NON_COMPLIANT", "NEEDS_REVIEW", "COMPLIANT"
+OUTCOMES = (NON_COMPLIANT, NEEDS_REVIEW, COMPLIANT)   # worst first
+OUTCOME_OF = {
+    FAIL: NON_COMPLIANT,              # deforestation after the cut-off
+    MANUAL_REVIEW: NEEDS_REVIEW,      # the map is unsure (probable, or one source only)
+    CANNOT_CHECK: NEEDS_REVIEW,       # outside the map or no data: nobody can say it's compliant
+    CHECK_LOCATION: NEEDS_REVIEW,     # on water: the coordinates are probably wrong
+    PASS: COMPLIANT,
+    # eudr_layers.plot_verdict (the evidence check)
+    "non-compliant": NON_COMPLIANT,
+    "probable deforestation": NEEDS_REVIEW,   # shown purple on the map: needs evidence
+    "needs review": NEEDS_REVIEW,
+    "not assessed": NEEDS_REVIEW,
+    "deforestation-free": COMPLIANT,
+}
+
+
+def outcome_of(verdict: str) -> str:
+    """Compliant, non-compliant or needs review, for a verdict of any check."""
+    return OUTCOME_OF[verdict]
 
 GEOD = Geod(ellps="WGS84")
 
@@ -207,16 +242,35 @@ def connect() -> psycopg.Connection:
 MAP_NAME_MAX = 40                          # keeps "map_" + the name far below PostgreSQL's 63
 SCHEMA_RE = re.compile(r"^map_[a-z0-9_]+$")
 
-CATALOGUE_SQL = """
-CREATE TABLE IF NOT EXISTS public.maps (
-    name         TEXT PRIMARY KEY,         -- what you called the map, e.g. 'jambi-v1'
-    schema_name  TEXT NOT NULL UNIQUE,     -- the schema holding its tables, e.g. 'map_jambi_v1'
-    source_file  TEXT,                     -- the TIFF it was built from
-    fingerprint  TEXT,                     -- identifies the exact map (see Fingerprint)
-    width        INT,                      -- pixels
-    height       INT,
-    added_at     TIMESTAMPTZ DEFAULT now()
-)"""
+SCHEMA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
+SECTION_RE = re.compile(r"^--\s*@(\w+)\s*$")
+
+
+@functools.lru_cache(maxsize=1)
+def _schema_sections() -> dict[str, str]:
+    """schema.sql cut into its sections: {name: SQL}. A section starts with a line '-- @name'."""
+    sections, name = {}, None
+    with open(SCHEMA_FILE, encoding="utf-8") as fh:
+        for line in fh:
+            found = SECTION_RE.match(line)
+            if found:
+                name = found.group(1)
+                sections[name] = ""
+            elif name is not None:
+                sections[name] += line
+    return sections
+
+
+def schema_sql(section: str, grid: "Grid | None" = None) -> str:
+    """One section of schema.sql, ready to run (several statements, no parameters). With a grid,
+    {schema} becomes its schema and {srid} its EPSG code."""
+    sql = _schema_sections()[section]
+    if grid is not None:
+        sql = sql.replace("{schema}", grid.schema or "public").replace("{srid}", str(int(grid.srid)))
+    return sql
+
+
+CATALOGUE_SQL = schema_sql("shared")   # public.maps
 
 NO_MAP_MESSAGE = ("No map in the database yet - build and upload one first, e.g.\n"
                   "  python pipeline.py --name jambi --data-dir YOUR_LAYERS --bbox 103.0 -2.3 103.5 -1.8\n"
@@ -250,58 +304,8 @@ def default_map_name(tif_path: str) -> str:
 
 def map_tables_sql(grid: Grid) -> str:
     """The tables every map has, whichever approach is built: its address system, and the farms
-    and verdicts saved for it - all in the map's own schema."""
-    t = grid.table
-    return f"""
-CREATE TABLE IF NOT EXISTS {t('grid_info')} (
-    map_version    TEXT PRIMARY KEY,
-    x0             DOUBLE PRECISION NOT NULL,  -- x of the map's top-left corner
-    y0             DOUBLE PRECISION NOT NULL,  -- y of the map's top-left corner
-    pixel_w        DOUBLE PRECISION NOT NULL,  -- pixel width  (map units)
-    pixel_h        DOUBLE PRECISION NOT NULL,  -- pixel height (map units)
-    width          INT NOT NULL,               -- pixels
-    height         INT NOT NULL,
-    srid           INT NOT NULL,               -- EPSG code, e.g. 4326
-    geographic     BOOLEAN NOT NULL,           -- true if the units are degrees
-    default_class  SMALLINT,                   -- the colour NOT stored (the map's most common)
-    fingerprint    TEXT,                       -- identifies the exact map that was uploaded
-    source_file    TEXT,
-    built_at       TIMESTAMPTZ DEFAULT now()
-);
-ALTER TABLE {t('grid_info')} ADD COLUMN IF NOT EXISTS default_class SMALLINT;
-ALTER TABLE {t('grid_info')} ADD COLUMN IF NOT EXISTS fingerprint TEXT;
-
-CREATE TABLE IF NOT EXISTS {t('plots')} (
-    plot_id      TEXT PRIMARY KEY,
-    supplier_id  TEXT,
-    declared_ha  REAL,
-    geojson      JSONB NOT NULL      -- the farm exactly as the supplier sent it
-);
-
-CREATE TABLE IF NOT EXISTS {t('plot_results')} (
-    plot_id        TEXT NOT NULL REFERENCES {t('plots')}(plot_id) ON DELETE CASCADE,
-    map_version    TEXT NOT NULL,
-    method         TEXT NOT NULL,      -- 'polygons', 'stencils', 'tiff-pixel', 'tiff-exact'
-    verdict        TEXT NOT NULL,
-    colours        TEXT,               -- every colour the farm touches, e.g. 'land, forest'
-    point_colour   TEXT,               -- point farms: the colour under the point
-    forest_ha      DOUBLE PRECISION,
-    land_ha        DOUBLE PRECISION,
-    deforested_ha  DOUBLE PRECISION,
-    review_ha      DOUBLE PRECISION,
-    water_ha       DOUBLE PRECISION,
-    no_data_ha     DOUBLE PRECISION,
-    note           TEXT,
-    checked_at     TIMESTAMPTZ DEFAULT now(),
-    PRIMARY KEY (plot_id, map_version, method)
-);
--- bring a results table made by the earlier version of these programs up to date
-ALTER TABLE {t('plot_results')} DROP COLUMN IF EXISTS answered_by_label;
-ALTER TABLE {t('plot_results')} ADD COLUMN IF NOT EXISTS colours TEXT;
-ALTER TABLE {t('plot_results')} ADD COLUMN IF NOT EXISTS point_colour TEXT;
-ALTER TABLE {t('plot_results')} ADD COLUMN IF NOT EXISTS forest_ha DOUBLE PRECISION;
-ALTER TABLE {t('plot_results')} ADD COLUMN IF NOT EXISTS land_ha DOUBLE PRECISION;
-"""
+    and verdicts saved for it - all in the map's own schema (schema.sql: @map, @map_upgrade)."""
+    return schema_sql("map", grid) + schema_sql("map_upgrade", grid)
 
 
 def copy_rows(conn: psycopg.Connection, table: str, columns: list[str], rows: list) -> None:
@@ -374,6 +378,8 @@ class Grid:
     default_class: int = field(default=LAND, compare=False)  # the colour that is not stored
     fingerprint: str = field(default="", compare=False)
     schema: str = field(default="", compare=False)  # where the map's tables live, e.g. map_jambi_v1
+    # the map's tables when it was loaded (load_grid), so a check needn't ask again (see has_tables)
+    tables: frozenset = field(default=frozenset(), compare=False)
 
     def table(self, name: str) -> str:
         """One of this map's tables, named with its schema: 'map_jambi_v1.stencil_pages'."""
@@ -536,14 +542,23 @@ def load_grid(conn: psycopg.Connection, name: str | None = None) -> Grid:
     """The address system of a stored map (see find_map for how the map is chosen)."""
     map_name, schema = find_map(conn, name)
     with conn.cursor() as cur:
+        # the map's tables come in the same query, so the checks don't each ask whether theirs exist
         cur.execute("SELECT map_version, x0, y0, pixel_w, pixel_h, width, height, srid, geographic, "
-                    f"default_class, fingerprint FROM {schema}.grid_info")
+                    "default_class, fingerprint, "
+                    "ARRAY(SELECT tablename::text FROM pg_catalog.pg_tables WHERE schemaname = %s) "
+                    f"FROM {schema}.grid_info", (schema,))
         row = cur.fetchone()
     if row is None or row[9] is None or row[10] is None:
         sys.exit(f"The map '{map_name}' is incomplete in the database. Delete it and upload it again:\n"
                  f"  python database/maps.py delete \"{map_name}\" --yes\n"
                  f"  python database/maps.py upload layers/YOUR_FOLDER --name \"{map_name}\"")
-    return Grid(*row, schema=schema)
+    return Grid(*row[:11], schema=schema, tables=frozenset(row[11]))
+
+
+def has_tables(conn: psycopg.Connection, grid: Grid, *names: str) -> bool:
+    """Whether the map has these tables. Answered from the list load_grid read (no round trip);
+    only a table missing from that list is looked up, in case it was built since."""
+    return all(name in grid.tables or table_exists(conn, grid.table(name)) for name in names)
 
 
 # --------------------------------------------------------------------------------------
@@ -733,12 +748,18 @@ class Farm:
     supplier_id: str | None = None
 
 
-def circle_from_point(lon: float, lat: float, area_ha: float, n: int = 64) -> Polygon:
-    """A circle with the farm's declared area, centred on its point."""
-    radius = math.sqrt(area_ha * 10_000 / math.pi)
-    azimuths = np.linspace(0.0, 360.0, n, endpoint=False)
-    lons, lats, _ = GEOD.fwd(np.full(n, lon), np.full(n, lat), azimuths, np.full(n, radius))
-    return Polygon(zip(lons, lats))
+POINT_AREA_HA = 4.0  # a point with no declared area stands for a plot of up to 4 ha (EU Information System)
+
+
+def circle_from_point(lon: float, lat: float, area_ha: float | None) -> Polygon:
+    """A circle with the farm's declared area (4 ha if none), centred on its point, in degrees.
+    Made exactly as eudr_layers.read_plots makes it, so a point covers the same pixels here as in
+    the evidence check."""
+    area_ha = area_ha or POINT_AREA_HA
+    r = math.sqrt(area_ha * 1e4 / math.pi)
+    unit = Point(0, 0).buffer(1, 64)
+    return affinity.translate(affinity.scale(unit, r / (111320 * math.cos(math.radians(lat))), r / 110574,
+                                             origin=(0, 0)), lon, lat)
 
 
 def _polygonal(geom):
@@ -765,7 +786,8 @@ def load_farms(path: str, grid: Grid, point_mode: str = "pixel") -> list[Farm]:
 
     point_mode:
       "pixel"  - a point is checked against the single pixel it lands on
-      "circle" - a point is turned into a circle with its declared area (stricter)
+      "circle" - a point is turned into a circle of its declared area, 4 ha if none (as
+                 eudr_layers.py and the EU Information System read it)
     """
     farms = farms_from_features(read_features(path), grid, point_mode)
     print(f"Loaded {len(farms)} farm{'' if len(farms) == 1 else 's'} from {os.path.basename(path)} "
@@ -820,7 +842,7 @@ def farms_from_features(features: list[dict], grid: Grid, point_mode: str = "pix
         geom = shape(feat["geometry"])
         if geom.geom_type == "Point":
             kind = "point"
-            if point_mode == "circle" and declared:
+            if point_mode == "circle":
                 geom, kind = circle_from_point(geom.x, geom.y, declared), "outline"
         elif geom.geom_type in ("Polygon", "MultiPolygon"):
             kind = "outline"
@@ -851,25 +873,31 @@ def farm_outside(farm: Farm, grid: Grid) -> bool:
     return not _map_box(grid).contains(farm.geom)
 
 
-def farm_pixels(farm: Farm, grid: Grid, all_touched: bool = True):
+def farm_pixels(farm: Farm, grid: Grid, all_touched: bool = False):
     """Pixels an outline covers: returns (row_off, col_off, mask), mask True = covered.
 
+    all_touched=False - pixels whose centre is inside the farm (the default). This is
+                        eudr_layers.plot_mask's rule, done the same way (GDAL rasterising, in C):
+                        a farm smaller than a pixel gets every pixel it touches.
     all_touched=True  - every pixel that overlaps the farm, however little (the cautious rule)
-    all_touched=False - only pixels whose centre is inside the farm
     Every method uses this same function, so they always look at exactly the same pixels.
     """
     r0, c0, r1, c1 = grid.pixel_range(farm.geom)
+    if not all_touched:
+        shape_ = (r1 - r0 + 1, c1 - c0 + 1)
+        transform = grid.window_transform(r0, c0)
+        mask = geometry_mask([farm.geom], out_shape=shape_, transform=transform, invert=True)
+        if not mask.any():  # farm smaller than a pixel: every pixel it touches, as eudr_layers.plot_mask
+            mask = geometry_mask([farm.geom], out_shape=shape_, transform=transform, invert=True,
+                                 all_touched=True)
+        return r0, c0, mask
     cols = np.arange(c0, c1 + 1)
     rows = np.arange(r0, r1 + 1)
     shapely.prepare(farm.geom)
-    if all_touched:
-        left, top = np.meshgrid(grid.x0 + cols * grid.pixel_w, grid.y0 - rows * grid.pixel_h)
-        pixels = shapely.box(left, top - grid.pixel_h, left + grid.pixel_w, top)
-        # overlapping by some area = intersecting, but not merely touching along an edge
-        mask = shapely.intersects(farm.geom, pixels) & ~shapely.touches(farm.geom, pixels)
-    else:
-        x, y = np.meshgrid(grid.x0 + (cols + 0.5) * grid.pixel_w, grid.y0 - (rows + 0.5) * grid.pixel_h)
-        mask = shapely.contains_xy(farm.geom, x, y)
+    left, top = np.meshgrid(grid.x0 + cols * grid.pixel_w, grid.y0 - rows * grid.pixel_h)
+    pixels = shapely.box(left, top - grid.pixel_h, left + grid.pixel_w, top)
+    # overlapping by some area = intersecting, but not merely touching along an edge
+    mask = shapely.intersects(farm.geom, pixels) & ~shapely.touches(farm.geom, pixels)
     if not mask.any():  # farm smaller than a pixel: use the pixel under its middle
         row, col = grid.point_to_pixel(*farm.geom.representative_point().coords[0])
         mask[row - r0, col - c0] = True
@@ -897,11 +925,27 @@ class PlotResult:
         return (self.verdict, self.present, self.point_colour)
 
     @property
+    def outcome(self) -> str:
+        """COMPLIANT, NON_COMPLIANT or NEEDS_REVIEW (the verdict says why)."""
+        return outcome_of(self.verdict)
+
+    @property
     def touches_forest(self) -> bool:
+        """Touches forest still standing today."""
         return FOREST in self.present
+
+    @property
+    def in_forest_2020(self) -> bool:
+        """The EUDR's two key questions: is the point in forest that stood on 31 Dec 2020, and does the
+        outline overlap it? (Forest since cleared counts: that is what the cut-off date asks about.)"""
+        return any(c in self.present for c in FOREST_2020)
 
     def ha(self, colour: int) -> float:
         return self.area_m2.get(colour, 0.0) / 10_000
+
+    def forest_2020_ha(self) -> float:
+        """Hectares of the farm that were forest on 31 Dec 2020 (outlines; 0 for points)."""
+        return sum(self.ha(c) for c in FOREST_2020)
 
     def colours_text(self) -> str:
         return ", ".join(CLASS_NAMES[c] for c in sorted(self.present))
@@ -982,12 +1026,12 @@ def write_csv(path: str, results: list[PlotResult]) -> None:
     make_parent(path)
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(["plot_id", "kind", "verdict", "point_colour", "colours_touched", "touches_forest",
-                    "forest_ha", "land_ha", "deforested_ha", "review_ha", "water_ha", "no_data_ha",
-                    "water_share", "note"])
+        w.writerow(["plot_id", "kind", "outcome", "verdict", "point_colour", "colours_touched", "in_forest_2020",
+                    "forest_2020_ha", "touches_forest", "forest_ha", "land_ha", "deforested_ha", "review_ha",
+                    "water_ha", "no_data_ha", "water_share", "note"])
         for r in results:
-            w.writerow([r.plot_id, r.kind, r.verdict, CLASS_NAMES.get(r.point_colour, ""),
-                        r.colours_text(), r.touches_forest,
+            w.writerow([r.plot_id, r.kind, r.outcome, r.verdict, CLASS_NAMES.get(r.point_colour, ""),
+                        r.colours_text(), r.in_forest_2020, f"{r.forest_2020_ha():.4f}", r.touches_forest,
                         f"{r.ha(FOREST):.4f}", f"{r.ha(LAND):.4f}", f"{r.ha(DEFORESTATION):.4f}",
                         f"{r.ha(REVIEW):.4f}", f"{r.ha(WATER):.4f}", f"{r.ha(NO_DATA):.4f}",
                         f"{r.water_share:.3f}", r.note])
@@ -999,11 +1043,15 @@ def print_summary(method: str, results: list[PlotResult], timings: dict) -> None
     counts = Counter(r.verdict for r in results)
     total = timings["total_s"]
     print(f"\n{method}: checked {n} farms in {total:.3f} s ({1000 * total / max(n, 1):.2f} ms per farm)")
-    for v in VERDICTS:
-        print(f"  {v:15s} {counts.get(v, 0)}")
+    for o in OUTCOMES:
+        print(f"  {o:15s} {sum(counts.get(v, 0) for v in VERDICTS if OUTCOME_OF[v] == o)}")
+    print("  why: " + ", ".join(f"{v} {counts.get(v, 0)}" for v in VERDICTS))
+    in_2020 = sum(r.kind == "point" and r.in_forest_2020 for r in results)
+    overlap_2020 = sum(r.kind == "outline" and r.in_forest_2020 for r in results)
     in_forest = sum(r.kind == "point" and r.touches_forest for r in results)
     overlap = sum(r.kind == "outline" and r.touches_forest for r in results)
-    print(f"  Forest: {in_forest} point farms are in forest, {overlap} outline farms overlap forest")
+    print(f"  Forest on 31 Dec 2020: {in_2020} point farms are in it, {overlap_2020} outline farms overlap it")
+    print(f"  Forest standing today: {in_forest} point farms are in it, {overlap} outline farms overlap it")
     if timings.get("used_labels"):
         print(f"  {timings['by_label']} of {n} farms were answered from the square labels alone (no geometry needed)")
 
@@ -1012,7 +1060,7 @@ def print_summary(method: str, results: list[PlotResult], timings: dict) -> None
 # The baseline: checking farms directly against the original TIFF
 # --------------------------------------------------------------------------------------
 def check_with_tiff(tif_path: str, grid: Grid, farms: list[Farm], mode: str = "pixel",
-                    all_touched: bool = True) -> tuple[list[PlotResult], dict]:
+                    all_touched: bool = False) -> tuple[list[PlotResult], dict]:
     """Check every farm by reading the original TIFF - the reference answer.
 
     mode="pixel" - count the pixels each farm covers (same rule as the stencil approach)

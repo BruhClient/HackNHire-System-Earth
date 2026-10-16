@@ -47,7 +47,7 @@ def main():
     out = service.check(features + outlines)
 
     wrong = 0
-    print("\nPoints (is the point in forest?):")
+    print("\nPoints (is the point in forest of 31 Dec 2020?):")
     for row in out["rows"]:
         if row["kind"] != "point":
             continue
@@ -55,11 +55,12 @@ def main():
         ok = all(v == expected[row["key"]] for v in got.values())
         wrong += not ok
         print(f"  {'OK ' if ok else 'BAD'} {row['name']:<22} stencils: {CLASS_LABELS[got['stencils']]:<14} "
-              f"outlines: {CLASS_LABELS[got['polygons']]:<14} verdict: {row['verdict']}")
+              f"outlines: {CLASS_LABELS[got['polygons']]:<14} 2020 forest: "
+              f"{'yes' if row['results']['polygons']['in_forest_2020'] else 'no':<4} verdict: {row['verdict']}")
 
     shapes = [r for r in out["rows"] if r["kind"] == "outline"]
     same = sum(1 for r in shapes if r["agree"]["stencils_polygons"])
-    print(f"\nOutlines (does the outline overlap forest?): same verdict on {same} of {len(shapes)}")
+    print(f"\nOutlines (does the outline overlap forest of 31 Dec 2020?): same verdict on {same} of {len(shapes)}")
     for r in shapes:
         if not r["agree"]["stencils_polygons"]:  # pixel rule vs exact area: can differ on slivers
             print(f"  differ: {r['name']}: stencils {r['results']['stencils']['verdict']}, "

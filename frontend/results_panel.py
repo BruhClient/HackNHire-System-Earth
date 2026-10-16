@@ -1,8 +1,11 @@
 """results_panel.py - the panel beside the map: each farm's verdict from both approaches, and how
 the two approaches compared on the last check, for each question:
 
-  "Is the point in forest?"          the points of the check, as one batch per approach
-  "Does the outline overlap forest?" the outlines of the check, as one batch per approach
+  "Is the point in forest of 31 Dec 2020?"          the points of the check, as one batch per approach
+  "Does the outline overlap forest of 31 Dec 2020?" the outlines of the check, as one batch per approach
+
+Forest of 31 Dec 2020 (the EUDR cut-off date) includes forest cleared since: the backend's
+common.FOREST_2020. The table's "2020 forest" column answers it for each farm.
 
 Numbers come from NeonService.check()["runs"] (see metering.py). Lower is better for all of them.
 """
@@ -16,13 +19,14 @@ from PyQt5.QtWidgets import (QAbstractItemView, QHeaderView, QLabel, QScrollArea
 
 from charts import ChartCard, PairBars, fmt_bytes, fmt_number
 from eudr_layer import colour_icon
-from legend import DEFORESTATION, FOREST, METHODS, VERDICT_STYLE
+from legend import DEFORESTATION, METHODS, VERDICT_DETAIL, VERDICT_STYLE
 
 APPROACHES = ("stencils", "polygons")
 SERIES = [(key, METHODS[key][0], METHODS[key][1]) for key in APPROACHES]
 APPROACH_OF_COLUMN = {2: "stencils", 3: "polygons"}
-QUESTIONS = {"point": "Is the point in forest?", "outline": "Does the outline overlap forest?"}
-COLUMNS = ["Farm", "Verdict", "Stencils", "Outlines", "Forest ha", "Deforested ha"]
+QUESTIONS = {"point": "Is the point in forest of 31 Dec 2020?",
+             "outline": "Does the outline overlap forest of 31 Dec 2020?"}
+COLUMNS = ["Farm", "Verdict", "Stencils", "Outlines", "2020 forest", "Deforested ha"]
 
 
 def fmt_ms(v):
@@ -85,18 +89,33 @@ def agreement(rows, kind):
     return sum(1 for r in picked if r["agree"]["stencils_polygons"]), len(picked)
 
 
+def fmt_table_ha(ha):
+    return "0" if ha == 0 else ("<0.01" if ha < 0.005 else f"{ha:,.2f}")
+
+
 def ha_text(row, code):
     if row["kind"] == "point":
         return "–"
-    ha = float(row["results"]["polygons"]["ha"].get(str(code), 0.0))
-    return "0" if ha == 0 else ("<0.01" if ha < 0.005 else f"{ha:,.2f}")
+    return fmt_table_ha(float(row["results"]["polygons"]["ha"].get(str(code), 0.0)))
+
+
+def forest_2020_text(row):
+    """The two key questions for one farm: a point is in 2020 forest or not; an outline overlaps
+    this many hectares of it (from the outlines' exact areas)."""
+    res = row["results"]["polygons"]
+    if res["outside"]:
+        return "–"
+    if row["kind"] == "point":
+        return "yes" if res["in_forest_2020"] else "no"
+    return fmt_table_ha(float(res["forest_2020_ha"])) + " ha"
 
 
 def table_cells(row):
     """The texts of one table row (the verdict cell's colour is added by the panel)."""
     def verdict_text(verdict):
         _, icon, headline = VERDICT_STYLE[verdict]
-        return f"{icon} {headline}"
+        why = "" if verdict in ("FAIL", "PASS") else f" · {VERDICT_DETAIL[verdict]}"
+        return f"{icon} {headline}{why}"
 
     name = row["name"] + (" (point)" if row["kind"] == "point" else "")
     if row.get("stale"):
@@ -104,7 +123,7 @@ def table_cells(row):
     return [name, verdict_text(row["verdict"]),
             VERDICT_STYLE[row["results"]["stencils"]["verdict"]][1],
             VERDICT_STYLE[row["results"]["polygons"]["verdict"]][1],
-            ha_text(row, FOREST), ha_text(row, DEFORESTATION)]
+            forest_2020_text(row), ha_text(row, DEFORESTATION)]
 
 
 class ResultsPanel(QScrollArea):
@@ -190,9 +209,13 @@ class ResultsPanel(QScrollArea):
                     item.setFont(font)
                 if c in (2, 3):  # each approach's verdict as its icon; the words are in the tooltip
                     item.setTextAlignment(Qt.AlignCenter)
-                    item.setToolTip(VERDICT_STYLE[row["results"][APPROACH_OF_COLUMN[c]]["verdict"]][2])
+                    verdict = row["results"][APPROACH_OF_COLUMN[c]]["verdict"]
+                    item.setToolTip(f"{VERDICT_STYLE[verdict][2]}: {VERDICT_DETAIL[verdict]}")
                 if c >= 4:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if c == 4:
+                    item.setToolTip("Forest on 31 Dec 2020, the EUDR cut-off date (including forest cleared "
+                                    "since): is the point in it, or how much of the outline overlaps it")
                 if c == 0:
                     item.setToolTip(text)
                 if row.get("stale"):

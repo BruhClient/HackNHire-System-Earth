@@ -1,41 +1,44 @@
 """
-stencil_approach.py - the STENCILS approach (Matthew's 8 x 8 bitmap idea).
+stencil_approach.py - the STENCILS approach: the map in zipped pages, answered on the client.
 
-For every colour except the map's most common one, the map becomes a yes/no stencil. The
-stencil is cut into 8 x 8 squares and each square's 64 yes/no values are squeezed into ONE
-64-bit number (pixel r, c inside a square is bit r * 8 + c). Then, as Matthew suggested,
-a standard compression algorithm crunches them down: each 256 x 256-pixel page's numbers -
-1,024 per colour - are zipped together into one row. Most numbers are 0 (none of that
-colour) or all ones (all of it), so a page zips down to a few hundred bytes.
+The map is cut into 256 x 256-pixel pages (Matthew's stencil idea: fetch only the pages a farm
+touches, in one query, and work out the answer locally). Each page holds its pixels' colours, one
+byte per pixel, compressed with lzma (Python's standard library, as raw LZMA2 with a 64 KB
+dictionary, so there are no headers to store and no big buffer to allocate when unpacking).
 
-Nothing is lost: anything not in a stencil is the most common colour (usually land), and
-the whole map can be rebuilt pixel for pixel.
+The first version stored each colour as an 8 x 8-pixel bitmap packed into a 64-bit number, zipped.
+Measured on the 6,000 x 6,000 Jambi map (30% forest), plain colour bytes take 25% less space with
+lzma (0.71 MB of pages instead of 0.95 MB) - the bitmaps only win on maps where every colour is
+rare - and a page unpacks in about the same time (~0.5 ms).
 
-Needs only plain PostgreSQL - no PostGIS. Checking a farm:
-    point   -> unzip the page it is on and test one bit per colour
-    outline -> unzip the pages it covers, AND the farm's own stencil with each colour's
-               stencil, and count the 1s left over (= pixels where they overlap)
+Nothing is lost: pages that are all the most common colour (usually land) get no row, and the
+whole map can be rebuilt pixel for pixel.
+
+Needs only plain PostgreSQL - no PostGIS. Checking a farm (one query for all the farms):
+    point   -> unpack the page it is on and read one pixel
+    outline -> unpack the pages it covers and count the colours of the pixels it covers
+               (common.farm_pixels: pixel centres inside, as eudr_layers.py; or --rule touched)
 
 The colours are the compaction step's outcome in 5 colours (layers/<map>/outcome_5class.tif, see
 layers.py), or any TIFF in the 5 colours.
 
 Commands (run from the backend folder; give a path, or a path inside layers/)
     python database/stencil_approach.py build  jambi/outcome_5class.tif [--map NAME]
-    python database/stencil_approach.py check  jambi/test_plots.geojson [--map NAME] [--rule touched|centre]
+    python database/stencil_approach.py check  jambi/test_plots.geojson [--map NAME] [--rule centre|touched]
                                                [--point-mode pixel|circle] [--csv FILE]
     python database/stencil_approach.py verify jambi/outcome_5class.tif [--map NAME]
 (To upload a new map with every approach at once, use database/maps.py upload.)
 
-Table (in the map's own schema, next to the shared ones in common.py)
-    stencil_pages   one row per page: (page_col, page_row, stencils)
-                    stencils = one layer of 64-bit numbers per colour code 0-5, zipped
+Table (in the map's own schema; defined in schema.sql, sections @stencils and @stencils_keys)
+    stencil_pages   one row per page: (page_col, page_row, colours)
+                    colours = the page's colour codes 0-5, one byte per pixel, lzma-compressed
 """
 
 import argparse
+import lzma
 import math
 import os
 import time
-import zlib
 
 import numpy as np
 import rasterio
@@ -45,27 +48,9 @@ import common
 METHOD = "stencils"
 TABLES = ["stencil_pages"]
 OTHER_TABLES = {"class_polys": "python database/polygon_approach.py build <your map>"}
-B = 8                          # squares are 8 x 8 pixels = 64 bits
-PAGE = common.PAGE             # pages are 256 x 256 pixels = 32 x 32 squares
-LAYERS = len(common.COLOURS)   # one stencil layer per colour code 0-5
-
-
-def to_numbers(yes: np.ndarray) -> np.ndarray:
-    """Yes/no pixels -> one 64-bit number per 8 x 8 square (shape: squares down x across)."""
-    h, w = yes.shape
-    H, W = -(-h // B) * B, -(-w // B) * B
-    padded = np.zeros((H, W), bool)
-    padded[:h, :w] = yes
-    squares = padded.reshape(H // B, B, W // B, B).swapaxes(1, 2).reshape(H // B, W // B, B * B)
-    return np.packbits(squares, axis=-1, bitorder="little").view("<u8")[..., 0]
-
-
-def to_pixels(numbers: np.ndarray) -> np.ndarray:
-    """64-bit numbers (squares down x across) -> yes/no pixels."""
-    rows, cols = numbers.shape
-    raw = np.ascontiguousarray(numbers, dtype="<u8").view(np.uint8).reshape(rows, cols, 8)
-    bits = np.unpackbits(raw, axis=-1, bitorder="little").reshape(rows, cols, B, B)
-    return bits.swapaxes(1, 2).reshape(rows * B, cols * B).astype(bool)
+PAGE = common.PAGE             # pages are 256 x 256 pixels
+# raw LZMA2 (no container): a page is at most 64 KB, so a bigger dictionary would only cost memory
+LZMA_FILTERS = [{"id": lzma.FILTER_LZMA2, "preset": 9 | lzma.PRESET_EXTREME, "dict_size": 1 << 16}]
 
 
 def page_size(grid: common.Grid, page_col: int, page_row: int) -> tuple[int, int]:
@@ -73,24 +58,20 @@ def page_size(grid: common.Grid, page_col: int, page_row: int) -> tuple[int, int
     return (min(PAGE, grid.height - page_row * PAGE), min(PAGE, grid.width - page_col * PAGE))
 
 
-def pack_page(data: np.ndarray, colours) -> np.ndarray:
-    """A page of colours -> stencil layers (colour code x squares down x squares across)."""
-    h, w = data.shape
-    layers = np.zeros((LAYERS, -(-h // B), -(-w // B)), "<u8")
-    for colour in colours:
-        yes = data == colour
-        if yes.any():
-            layers[colour] = to_numbers(yes)
-    return layers
+def pack_page(data: np.ndarray) -> bytes:
+    """A page of colours (height x width, values 0-5) -> what is stored."""
+    return lzma.compress(np.ascontiguousarray(data, np.uint8).tobytes(), format=lzma.FORMAT_RAW,
+                         filters=LZMA_FILTERS)
 
 
 def unzip_page(blob: bytes, height: int, width: int) -> np.ndarray:
-    """A stored page -> its stencil layers, for a page of height x width pixels."""
-    return np.frombuffer(zlib.decompress(blob), dtype="<u8").reshape(LAYERS, -(-height // B), -(-width // B))
+    """A stored page -> its colours (height x width, uint8)."""
+    raw = lzma.decompress(bytes(blob), format=lzma.FORMAT_RAW, filters=LZMA_FILTERS)
+    return np.frombuffer(raw, np.uint8).reshape(height, width)
 
 
 def ensure_built(conn, grid: common.Grid) -> None:
-    if not common.table_exists(conn, grid.table("stencil_pages")):
+    if not common.has_tables(conn, grid, "stencil_pages"):
         raise SystemExit(f"The map '{grid.map_version}' has no stencils yet - build them first:\n"
                          f"  python database/stencil_approach.py build jambi/outcome_5class.tif --map \"{grid.map_version}\"")
 
@@ -100,43 +81,33 @@ def ensure_built(conn, grid: common.Grid) -> None:
 # --------------------------------------------------------------------------------------
 def build(conn, tif: str, map_name: str, report=None, tidy: bool = True) -> common.Grid:
     """Pack the TIFF into the map's stencil_pages. report(label, done, total) follows the progress.
-    tidy=False leaves the transaction open and skips VACUUM (maps.upload builds both approaches
+    tidy=False leaves the transaction open and skips VACUUM (maps.upload builds every approach
     in one transaction, then tidies up)."""
     start = time.perf_counter()
     with rasterio.open(tif) as src:
-        grid, counts = common.start_build(conn, src, tif, map_name, OTHER_TABLES, report)
-        stored = common.stored_colours(grid, counts)
+        grid, _ = common.start_build(conn, src, tif, map_name, OTHER_TABLES, report)
         table = grid.table("stencil_pages")
         with conn.cursor() as cur:
             cur.execute(f"DROP TABLE IF EXISTS {table}")
-            cur.execute(f"""
-                CREATE TABLE {table} (
-                    page_col  INT NOT NULL,     -- which 256 x 256 page (column)
-                    page_row  INT NOT NULL,     -- which 256 x 256 page (row)
-                    stencils  BYTEA NOT NULL    -- per colour code 0-5: the page's 8 x 8 squares
-                                                -- as 64-bit numbers - all zipped together
-                )""")
-            # keep big zipped pages inside the table rows instead of a side table (measured: ~6% smaller)
-            cur.execute(f"ALTER TABLE {table} ALTER COLUMN stencils SET STORAGE MAIN")
+            cur.execute(common.schema_sql("stencils", grid))    # schema.sql: the table
 
         rows = []
         progress = common.Progress(common.page_count(src), "packing pages", report)
         for page in common.iter_pages(src):
-            layers = pack_page(page.data, stored)
-            if layers.any():  # a page that is all the most common colour needs no row at all
-                rows.append((page.page_col, page.page_row, zlib.compress(layers.tobytes(), 9)))
+            if (page.data != grid.default_class).any():  # a page all the most common colour needs no row
+                rows.append((page.page_col, page.page_row, pack_page(page.data)))
             if len(rows) > 2_000:
-                common.copy_rows(conn, table, ["page_col", "page_row", "stencils"], rows)
+                common.copy_rows(conn, table, ["page_col", "page_row", "colours"], rows)
                 rows.clear()
             progress.step()
-        common.copy_rows(conn, table, ["page_col", "page_row", "stencils"], rows)
+        common.copy_rows(conn, table, ["page_col", "page_row", "colours"], rows)
 
         print("  building the index...")
         if report is not None:
             report("building the index", 0, 1)
         with conn.cursor() as cur:
             # The primary key IS the index: a farm's location says exactly which pages to fetch.
-            cur.execute(f"ALTER TABLE {table} ADD PRIMARY KEY (page_row, page_col)")
+            cur.execute(common.schema_sql("stencils_keys", grid))
         if report is not None:
             report("building the index", 1, 1)  # last report before the commit: a Cancel still undoes it all
     if tidy:
@@ -149,43 +120,48 @@ def build(conn, tif: str, map_name: str, report=None, tidy: bool = True) -> comm
 # --------------------------------------------------------------------------------------
 # check
 # --------------------------------------------------------------------------------------
+def fetch_pages(conn, grid: common.Grid, needed: set) -> dict:
+    """{(page_col, page_row): colours} for the needed pages, in one query. A page with no row is
+    all the default colour, so it is simply missing from the answer."""
+    pages = {}
+    if needed:
+        page_cols, page_rows = zip(*needed)
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT s.page_col, s.page_row, s.colours
+                FROM unnest(%s::int[], %s::int[]) AS q(pc, pr)
+                JOIN {grid.table("stencil_pages")} s ON s.page_col = q.pc AND s.page_row = q.pr
+                """, (list(page_cols), list(page_rows)))
+            for pc, pr, blob in cur.fetchall():
+                pages[(pc, pr)] = unzip_page(blob, *page_size(grid, pc, pr))
+    return pages
+
+
 def colour_at(pages: dict, grid: common.Grid, row: int, col: int) -> int:
-    """The colour of one pixel: test one bit in each colour's stencil."""
-    layers = pages.get((col // PAGE, row // PAGE))
-    if layers is not None:
-        r, c = row % PAGE, col % PAGE
-        bit = (r % B) * B + (c % B)
-        for colour in range(LAYERS):
-            if (int(layers[colour, r // B, c // B]) >> bit) & 1:
-                return colour
-    return grid.default_class
+    """The colour of one pixel."""
+    page = pages.get((col // PAGE, row // PAGE))
+    return grid.default_class if page is None else int(page[row % PAGE, col % PAGE])
 
 
 def window_colours(pages: dict, grid: common.Grid, r0: int, c0: int, h: int, w: int) -> np.ndarray:
-    """The colours of a block of pixels, unpacking only the 8 x 8 squares it needs."""
+    """The colours of a block of pixels (rows r0:r0+h, columns c0:c0+w)."""
     out = np.full((h, w), grid.default_class, np.uint8)
     for pr in range(r0 // PAGE, (r0 + h - 1) // PAGE + 1):
         for pc in range(c0 // PAGE, (c0 + w - 1) // PAGE + 1):
-            layers = pages.get((pc, pr))
-            if layers is None:
+            page = pages.get((pc, pr))
+            if page is None:
                 continue
             top, left = pr * PAGE, pc * PAGE  # the page's first pixel
-            r_from, r_to = max(r0, top), min(r0 + h, top + PAGE, grid.height)
-            c_from, c_to = max(c0, left), min(c0 + w, left + PAGE, grid.width)
-            s_top, s_left = (r_from - top) // B, (c_from - left) // B
-            s_bottom, s_right = (r_to - 1 - top) // B + 1, (c_to - 1 - left) // B + 1
-            y0, x0 = r_from - top - s_top * B, c_from - left - s_left * B
-            target = out[r_from - r0:r_to - r0, c_from - c0:c_to - c0]
-            for colour in range(LAYERS):
-                numbers = layers[colour, s_top:s_bottom, s_left:s_right]
-                if numbers.any():
-                    yes = to_pixels(numbers)
-                    target[yes[y0:y0 + r_to - r_from, x0:x0 + c_to - c_from]] = colour
+            r_from, r_to = max(r0, top), min(r0 + h, top + page.shape[0])
+            c_from, c_to = max(c0, left), min(c0 + w, left + page.shape[1])
+            out[r_from - r0:r_to - r0, c_from - c0:c_to - c0] = page[r_from - top:r_to - top, c_from - left:c_to - left]
     return out
 
 
-def check(conn, grid: common.Grid, farms: list[common.Farm], all_touched: bool = True):
-    """Returns (results, timings). One query fetches every page that any farm needs."""
+def check(conn, grid: common.Grid, farms: list[common.Farm], all_touched: bool = False):
+    """Returns (results, timings). One query fetches every page that any farm needs.
+    all_touched=False: an outline covers the pixels whose centre is inside it (eudr_layers.py's
+    rule, so the answers match the evidence check's); True: every pixel it overlaps (cautious)."""
     ensure_built(conn, grid)
     t0 = time.perf_counter()
     results: list = [None] * len(farms)
@@ -204,25 +180,14 @@ def check(conn, grid: common.Grid, farms: list[common.Farm], all_touched: bool =
                 for pc in range(c0 // PAGE, (c0 + mask.shape[1] - 1) // PAGE + 1):
                     needed.add((pc, pr))
 
-    pages = {}  # (page_col, page_row) -> stencil layers
-    if needed:
-        page_cols, page_rows = zip(*needed)
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                SELECT s.page_col, s.page_row, s.stencils
-                FROM unnest(%s::int[], %s::int[]) AS q(pc, pr)
-                JOIN {grid.table("stencil_pages")} s ON s.page_col = q.pc AND s.page_row = q.pr
-                """, (list(page_cols), list(page_rows)))
-            for pc, pr, blob in cur.fetchall():
-                pages[(pc, pr)] = unzip_page(blob, *page_size(grid, pc, pr))
-
+    pages = fetch_pages(conn, grid, needed)
     for i, (row, col) in points.items():
         results[i] = common.point_result(farms[i], colour_at(pages, grid, row, col))
     for i, (r0, c0, mask) in outlines.items():
         colours = window_colours(pages, grid, r0, c0, *mask.shape)
-        counts = np.bincount(colours[mask], minlength=LAYERS)
+        counts = np.bincount(colours[mask], minlength=len(common.COLOURS))
         results[i] = common.pixel_result(farms[i], grid, counts, r0, mask.shape[0])
-    return results, {"total_s": time.perf_counter() - t0}
+    return results, {"total_s": time.perf_counter() - t0, "pages": len(pages)}
 
 
 # --------------------------------------------------------------------------------------
@@ -238,15 +203,11 @@ def verify(conn, grid: common.Grid, tif: str) -> dict:
             fingerprint.add(expected)
             h, w = expected.shape
             rebuilt = np.full((h, w), grid.default_class, np.uint8)
-            cur.execute(f"SELECT page_col, stencils FROM {grid.table('stencil_pages')} WHERE page_row = %s",
+            cur.execute(f"SELECT page_col, colours FROM {grid.table('stencil_pages')} WHERE page_row = %s",
                         (row_off // PAGE,))
             for pc, blob in cur.fetchall():
                 ph, pw = page_size(grid, pc, row_off // PAGE)
-                layers = unzip_page(blob, ph, pw)
-                target = rebuilt[:, pc * PAGE:pc * PAGE + pw]
-                for colour in range(LAYERS):
-                    if layers[colour].any():
-                        target[to_pixels(layers[colour])[:ph, :pw]] = colour
+                rebuilt[:, pc * PAGE:pc * PAGE + pw] = unzip_page(blob, ph, pw)
             mismatched += int((rebuilt != expected).sum())
             total += h * w
             progress.step()
@@ -259,17 +220,18 @@ def verify(conn, grid: common.Grid, tif: str) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    b = sub.add_parser("build", help="pack the TIFF into zipped 64-bit squares and upload them")
+    b = sub.add_parser("build", help="pack the TIFF into compressed pages and upload them")
     b.add_argument("tif", help="the 5-colour TIFF (a path, or a path inside layers/, e.g. jambi/outcome_5class.tif)")
     b.add_argument("--map", help="the map's name (default: the TIFF's file name)")
     c = sub.add_parser("check", help="give a verdict for every farm in a GeoJSON file")
     c.add_argument("plots", help="GeoJSON of farms (a path, or a path inside layers/, e.g. jambi/test_plots.geojson)")
     c.add_argument("--map", help="which stored map to check against (needed when there are several)")
-    c.add_argument("--rule", choices=["touched", "centre"], default="touched",
-                   help="touched: every pixel that overlaps an outline counts (cautious); "
-                        "centre: only pixels whose centre is inside")
+    c.add_argument("--rule", choices=["centre", "touched"], default="centre",
+                   help="centre: pixels whose centre is inside an outline (eudr_layers.py's rule, default); "
+                        "touched: every pixel that overlaps it (cautious)")
     c.add_argument("--point-mode", choices=["pixel", "circle"], default="pixel",
-                   help="pixel: check the pixel under each point; circle: use the declared area")
+                   help="pixel: check the pixel under each point (default); circle: a circle of its declared "
+                        "area, 4 ha if none, as eudr_layers.py and the EU system do")
     c.add_argument("--csv", default=os.path.join(common.DATABASE_DIR, "results", "results_stencils.csv"),
                    help="where to write the verdicts (default: database/results/results_stencils.csv)")
     v = sub.add_parser("verify", help="rebuild the map from the database and compare it with the TIFF")

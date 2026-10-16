@@ -12,7 +12,7 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import QActionGroup, QFileDialog, QMenu, QMessageBox, QToolButton
 
 from farms import features_from_file
-from legend import METHODS, VERDICT_ORDER, VERDICT_STYLE
+from legend import METHODS, OUTCOME_STYLE, VERDICT_ORDER
 from report import worst
 
 GEOJSON_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -70,9 +70,11 @@ class CheckController:
         check_menu.addAction(self.check_sel_act)
         check_menu.addSeparator()
         self.point_mode = self.choice(check_menu, "Check points as", [
-            ("The pixel under the point", "pixel"), ("A circle of the declared area (area_ha)", "circle")])
+            ("The pixel under the point", "pixel"),
+            ("A circle of the declared area (area_ha; 4 ha if none, as the EU system)", "circle")])
         self.rule = self.choice(check_menu, "Stencil rule", [
-            ("Every pixel an outline touches", "touched"), ("Pixels whose centre is inside", "centre")])
+            ("Pixels whose centre is inside (as the evidence check)", "centre"),
+            ("Every pixel an outline touches (cautious)", "touched")])
         check_menu.addSeparator()
         self.tiff_act = check_menu.addAction("Compare with the original TIFF")
         self.tiff_act.setCheckable(True)
@@ -192,8 +194,8 @@ class CheckController:
         if not rows:
             self.w.statusBar().showMessage("Nothing to check.", 6000)
             return
-        counts = [(v, sum(1 for r in rows if r["verdict"] == v)) for v in VERDICT_ORDER]
-        parts = ", ".join(f"{n} {VERDICT_STYLE[v][2].lower()}" for v, n in counts if n)
+        counts = [(o, sum(1 for r in rows if r["outcome"] == o)) for o in OUTCOME_STYLE]
+        parts = ", ".join(f"{n} {OUTCOME_STYLE[o][2].lower()}" for o, n in counts if n)
         times = ", ".join(f"{METHODS[m][0].lower()} {1000 * s['timing'][m]['total_s']:.0f} ms"
                           for m in ("stencils", "polygons"))
         saved = " · saved to Neon" if result["options"]["saved"] else ""

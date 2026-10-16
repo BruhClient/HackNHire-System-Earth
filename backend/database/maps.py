@@ -15,10 +15,15 @@ What to upload:
   * or a TIFF in the 5 colours (0 land, 1 water, 2 forest, 3 deforestation, 4 needs review): the
     stencils and outlines only - this is what the app uploads
 
+Every table is defined in schema.sql. The shared ones are made once (init); a map's own tables are
+made from the same file when it is uploaded.
+
 Commands (run from the backend folder; give a path, or a name inside layers/)
+    python database/maps.py init                                     # once, on a fresh database
     python database/maps.py list
     python database/maps.py upload layers/jambi [--name "Jambi v1"]  # a results folder: all three approaches
     python database/maps.py upload my_map.tif [--name "Jambi v1"]    # a 5-colour TIFF: stencils + outlines
+    (add --no-outlines to either for the lean version: stencils (+ evidence) only, ~24x less storage)
     python database/maps.py rename "Jambi v1" "Jambi 2024"           # its schema follows the name
     python database/maps.py delete "Jambi v1" --yes                  # can't be undone
     python database/maps.py migrate [--name jambi-v1]                # a map stored the old way
@@ -31,6 +36,7 @@ import os
 import sys
 import time
 
+import psycopg
 import rasterio
 
 import common
@@ -50,6 +56,28 @@ def size_problem(width: int, height: int) -> str:
     return (f"This map is {width:,} x {height:,} pixels. The app keeps the whole map in memory, so it "
             f"supports up to {MAX_PIXELS // 1_000_000} million pixels (e.g. 10,000 x 10,000). "
             "Crop it into smaller areas first.")
+
+
+def init(conn) -> dict:
+    """Set up a fresh database once: the list of maps (public.maps) and PostGIS, from schema.sql's
+    @shared and @postgis sections. Each map's own tables are made from the same file when it is
+    uploaded. Safe to run again: nothing that exists is changed. PostGIS is optional (only the
+    outlines need it), so a database without it is still set up."""
+    with conn.cursor() as cur:
+        cur.execute(common.schema_sql("shared"))
+    conn.commit()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(common.schema_sql("postgis"))
+            cur.execute("SELECT postgis_lib_version()")
+            postgis = cur.fetchone()[0]
+        conn.commit()
+    except psycopg.Error as exc:
+        conn.rollback()
+        postgis = None
+        print(f"  PostGIS could not be switched on ({str(exc).strip()}). The stencils and the evidence "
+              "don't need it; upload with --no-outlines, or switch PostGIS on in Neon and run init again.")
+    return {"maps_table": True, "postgis": postgis}
 
 
 def list_maps(conn, with_evidence: bool = False) -> list[dict]:
@@ -81,12 +109,14 @@ def list_maps(conn, with_evidence: bool = False) -> list[dict]:
     return stored
 
 
-def upload(conn, source: str, name: str, report=None) -> common.Grid:
+def upload(conn, source: str, name: str, report=None, outlines: bool = True) -> common.Grid:
     """A new map, in one transaction: if anything fails or is cancelled (report may raise),
     everything is rolled back and the database is as it was. Then the new tables are packed
     (VACUUM ANALYZE), which can't run inside a transaction.
     source: a results folder of the compaction step (all three approaches), or a 5-colour TIFF
-    (stencils and outlines)."""
+    (stencils and outlines). outlines=False leaves the outlines out: the stencils (and the
+    evidence) answer every check, and the outlines take ~24x the stencils' storage. The app's
+    comparison of the two approaches needs them."""
     name = (name or "").strip()
     common.map_schema(name)  # stops here if the name can't be used
     results, tif = None, source
@@ -109,8 +139,9 @@ def upload(conn, source: str, name: str, report=None) -> common.Grid:
         sys.exit(problem)
     start = time.perf_counter()
     try:
-        stencil_approach.build(conn, tif, name, report, tidy=False)
-        grid = polygon_approach.build(conn, tif, name, report, tidy=False)
+        grid = stencil_approach.build(conn, tif, name, report, tidy=False)
+        if outlines:
+            grid = polygon_approach.build(conn, tif, name, report, tidy=False)
         if results is not None:
             import evidence_approach
             evidence_approach.build(conn, results, name, report, tidy=False)
@@ -126,13 +157,15 @@ def upload(conn, source: str, name: str, report=None) -> common.Grid:
             except Exception:  # noqa: BLE001 - e.g. the app's Cancelled: too late, finish tidying
                 pass
 
-    built = ["stencil_pages", "class_polys", "square_labels"] + (["evidence_pages"] if results else [])
+    built = (["stencil_pages"] + (["class_polys", "square_labels"] if outlines else [])
+             + (["evidence_pages"] if results else []))
     tables = [grid.table(t) for t in built]
     for i, table in enumerate(tables):
         tell("tidying up", i, len(tables))
         common.tidy_up(conn, table)
     tell("tidying up", len(tables), len(tables))
-    what = "all three approaches" if results else "both approaches"
+    what = ", ".join(n for n, on in (("stencils", True), ("outlines", outlines), ("evidence pages", results))
+                     if on)
     print(f"Uploaded '{name}' ({what}) in {time.perf_counter() - start:.1f} s")
     common.print_storage(conn, [grid.table(t) for t in MAP_TABLES])
     return grid
@@ -270,11 +303,15 @@ def print_list(stored: list[dict]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init", help="set up a fresh database once: the list of maps and PostGIS (schema.sql)")
     sub.add_parser("list", help="list the maps stored in the database")
     u = sub.add_parser("upload", help="upload a results folder (all three approaches) or a 5-colour TIFF "
                                       "(stencils and outlines) as a new map")
     u.add_argument("source", help="a results folder (its path, or its name in layers/), or a TIFF")
     u.add_argument("--name", help="the map's name (default: the folder's or the TIFF's name, e.g. jambi)")
+    u.add_argument("--no-outlines", action="store_true",
+                   help="leave the outlines out: ~24x less storage; the stencils (and evidence) answer every "
+                        "check, but the app can't compare the two approaches on this map")
     r = sub.add_parser("rename", help="give a map a new name (nothing is copied)")
     r.add_argument("name", help="the map's name now (see: list)")
     r.add_argument("new_name", help="its new name")
@@ -290,10 +327,16 @@ def main() -> None:
     source = upload_source(args.source) if args.cmd == "upload" else None
 
     with common.connect() as conn:
-        if args.cmd == "list":
+        if args.cmd == "init":
+            done = init(conn)
+            print("Set up: public.maps (the list of maps)"
+                  + (f", PostGIS {done['postgis']}" if done["postgis"] else "")
+                  + ". Each map's tables are made from schema.sql when it is uploaded.")
+        elif args.cmd == "list":
             print_list(list_maps(conn, with_evidence=True))
         elif args.cmd == "upload":
-            upload(conn, source, args.name or common.default_map_name(os.path.normpath(source)))
+            upload(conn, source, args.name or common.default_map_name(os.path.normpath(source)),
+                   outlines=not args.no_outlines)
         elif args.cmd == "rename":
             info = rename(conn, args.name, args.new_name)
             print(f"Renamed '{info['old']}' to '{info['name']}' (schema {info['schema']}).")

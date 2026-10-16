@@ -42,12 +42,18 @@ def classes_from_pages(grid, rows):
     out = np.full((grid.height, grid.width), grid.default_class, np.uint8)
     for page_col, page_row, blob in rows:
         h, w = stencil_approach.page_size(grid, page_col, page_row)
-        layers = stencil_approach.unzip_page(bytes(blob), h, w)
-        target = out[page_row * PAGE:page_row * PAGE + h, page_col * PAGE:page_col * PAGE + w]
-        for colour in range(stencil_approach.LAYERS):
-            if layers[colour].any():
-                target[stencil_approach.to_pixels(layers[colour])[:h, :w]] = colour
+        out[page_row * PAGE:page_row * PAGE + h, page_col * PAGE:page_col * PAGE + w] = \
+            stencil_approach.unzip_page(bytes(blob), h, w)
     return out
+
+
+def need_outlines(grid):
+    """The app compares stencils with outlines: stop with a clear message on a map without them."""
+    if not {"class_polys", "square_labels"} <= grid.tables:
+        raise SystemExit(f"The map '{grid.map_version}' was uploaded without outlines (--no-outlines), so the "
+                         "app can't compare the two approaches on it. Upload it again with Maps ▸ Upload map… "
+                         "(which builds both), or check it from the command line: "
+                         "python database/stencil_approach.py check FARMS.geojson --map NAME")
 
 
 def lonlat_transformers(grid):
@@ -203,7 +209,7 @@ class NeonService:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT source_file FROM {grid.table('grid_info')} LIMIT 1")
                 source_file = cur.fetchone()[0]
-                cur.execute(f"SELECT page_col, page_row, stencils FROM {grid.table('stencil_pages')}")
+                cur.execute(f"SELECT page_col, page_row, colours FROM {grid.table('stencil_pages')}")
                 rows = cur.fetchall()
             return grid, source_file, rows
 
@@ -256,9 +262,9 @@ class NeonService:
         }
 
     # ----- checking farms -----
-    QUESTIONS = ("point", "outline")  # "is the point in forest?", "does the outline overlap forest?"
+    QUESTIONS = ("point", "outline")  # "is the point in forest of 31 Dec 2020?", "does the outline overlap it?"
 
-    def check(self, features, point_mode="pixel", rule="touched", with_tiff=True, save=False,
+    def check(self, features, point_mode="pixel", rule="centre", with_tiff=True, save=False,
               explain=True):
         """Check farms with both approaches against Neon, and with the TIFF when it is the same map.
         features: GeoJSON features from the map (properties: id, name).
@@ -268,6 +274,7 @@ class NeonService:
         Every run is metered (round trips, rows, bytes, time over Neon); with explain=True its data
         queries are run again under EXPLAIN (ANALYZE, BUFFERS) for the server's side."""
         grid, all_touched = self.grid, rule == "touched"
+        need_outlines(grid)
         farms, keys, skipped = prepare_farms(features, grid, point_mode)
         results = {m: [None] * len(farms) for m in ("stencils", "polygons")}
         seconds = {"stencils": 0.0, "polygons": 0.0}
@@ -306,7 +313,7 @@ class NeonService:
                 "options": {"point_mode": point_mode, "rule": rule, "tiff": use_tiff,
                             "saved": bool(save and farms), "explain": bool(explain)}}
 
-    def _measure(self, conn, method, farms, all_touched=True):
+    def _measure(self, conn, method, farms, all_touched=False):
         """One approach on one batch of farms, metered, then rolled back.
         Returns (answers, stats, query log)."""
         metered = metering.MeteredConnection(conn)
@@ -355,6 +362,7 @@ class NeonService:
         Each run is its own transaction, rolled back, so nothing is written. Reports the median run
         of `repeat` (by time over Neon); explain=True adds the median run's server numbers."""
         progress = progress or (lambda done, total, text: None)
+        need_outlines(self.grid)
         methods, questions = ("stencils", "polygons"), ("point", "outline")
         total = len(sizes) * len(questions) * len(methods) * repeat
         out = {"map": self.grid.map_version, "sizes": list(sizes), "repeat": repeat,
