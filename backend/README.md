@@ -35,8 +35,8 @@ rebuilds the whole map from Neon and matches the file bit for bit.
 backend/                         <- run every command from here
 ├── .env                         <- YOU CREATE THIS: your Neon connection string (never in Git)
 ├── pipeline.py                  <- the whole chain: compaction -> upload -> check
-├── requirements.txt
-├── Dockerfile
+├── ingest_app.py                <- the same chain in a window: choose the data, name the map, watch it run
+├── Dockerfile                   <- (the packages are in ../requirements.txt, one file for the whole project)
 ├── compaction/                  <- step 1
 │   ├── eudr_layers.py           <- Joe's code: satellite layers -> evidence.tif, outcome.tif, ...
 │   └── make_test_layers.py      <- made-up satellite layers, to try everything without real data
@@ -91,7 +91,8 @@ There is no `data/` folder any more:
 3. Create a virtual environment and activate it:
    - Windows: `python -m venv venv`, then `venv\Scripts\activate`
    - macOS / Linux: `python3 -m venv venv`, then `source venv/bin/activate`
-4. Install the packages: `pip install -r requirements.txt`
+4. Install the packages from the project's one list, in the HackNHire folder: `pip install -r ..\requirements.txt`
+   (macOS / Linux: `../requirements.txt`)
 
 ## Step 1: Connect to Neon (`.env`)
 
@@ -307,13 +308,14 @@ Every script explains itself with `--help`, e.g. `python database/stencil_approa
 
 ## Running in Docker (optional)
 
-The database stays on Neon; the container just runs the scripts. From the backend folder:
+The database stays on Neon; the container just runs the scripts. From the **HackNHire** folder (the
+image reads the project's one `requirements.txt` there, without the PyQt5 windows):
 
 ```
-docker build -t eudr-storage .
-docker run --rm -v "$(pwd):/project" eudr-storage database/test_connection.py
-docker run --rm -v "$(pwd):/project" -v "D:/eudr/inputs:/inputs" eudr-storage pipeline.py --name jambi --data-dir /inputs --bbox 103.0 -2.3 103.5 -1.8
-docker run --rm -v "$(pwd):/project" eudr-storage compare/compare.py jambi --map jambi
+docker build -f backend/Dockerfile -t eudr-storage .
+docker run --rm -v "$(pwd)/backend:/project" eudr-storage database/test_connection.py
+docker run --rm -v "$(pwd)/backend:/project" -v "D:/eudr/inputs:/inputs" eudr-storage pipeline.py --name jambi --data-dir /inputs --bbox 103.0 -2.3 103.5 -1.8
+docker run --rm -v "$(pwd)/backend:/project" eudr-storage compare/compare.py jambi --map jambi
 ```
 
 The first `-v` shares the backend folder, so the container reads your `.env` and writes `layers/` and the

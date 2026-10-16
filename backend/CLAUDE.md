@@ -12,7 +12,7 @@ Student prototype for a SystemEarth challenge, in two steps:
 
    They compete on storage, query speed, decision fidelity and pixel fidelity.
 
-`pipeline.py` runs both steps.
+`pipeline.py` runs both steps; `ingest_app.py` is a window around it (choose the data, name the map, follow the progress).
 
 Also:
 - The brief also asks for an EUDR layer analysis, an encoding strategy and, as a bonus, a cost
@@ -76,6 +76,7 @@ Each TIFF pixel holds one value:
 
 ## Layout
 - `pipeline.py`: compaction -> upload -> check the plots against Neon and compare with `evidence.tif`.
+- `ingest_app.py`: the ingest window (PyQt5, in the root `requirements.txt`). It runs `pipeline.py` as a separate process and reads its output (`Step N of 3`, `common.Progress`'s `label: NN.N%` lines, the "Every output the same…" line), so keep those lines' wording when changing them. Its "What the folder must contain" panel (`LAYER_GROUPS`) lists the word each layer's file name must contain, copied from `eudr_layers.DISCOVERY`: change both together. It is the only way maps get into Neon from a window: the frontend no longer uploads.
 - `compaction/eudr_layers.py` (Joe's), `compaction/make_test_layers.py` (made-up satellite layers).
 - `database/layers.py`: a results folder as the database sees it (`results_folder`, `class_map`,
   `rule_from`, `check_layout`, `joe_grid`). Imports `eudr_layers` (needs scipy and pandas).
@@ -214,7 +215,8 @@ maps, `frontend\smoke_maps.py` (writes only a throwaway map).
 - Plain English for a student audience, British/Singapore spelling (colour, metres). Error
   messages say how to fix the problem (`SystemExit` with the next step).
 - Keep the code Python 3.10 compatible (no 3.12-only f-string syntax). Don't add dependencies
-  beyond `requirements.txt`.
+  beyond the one `requirements.txt` in the HackNHire folder (shared with the frontend; the Docker
+  image installs it without the PyQt5 lines).
 - When behaviour or numbers change, update `README.md` (steps, options, results, honest notes)
   and the docstring at the top of the script.
 
