@@ -26,7 +26,7 @@ Stencils and outlines store the outcome in 5 colours. They give the same verdict
 
 **Protected areas.** GeoJSON files named `wdpa*.geojson` (WDPA polygons) given at ingest are stored with the map (`protected_areas`, `backend/database/protected_areas.py`), and the app draws them as "Protected areas". A farm in one needs review: `protected_areas.check`/`apply` turn any lesser verdict into `MANUAL_REVIEW` (deforestation stays `FAIL`), the same for stencils, outlines and the TIFF baseline. Evidence-page checks keep Joe's verdict and reason, but their outcome turns a deforestation-free plot in a protected area into needs review.
 
-**Maps.** Each map lives in its own schema (`map_<name>`, e.g. `map_indonesia1`). The schema holds `grid_info`, each approach's tables, `plots`, `plot_results` and `evidence_results`. `public.maps` lists the maps. Every query names its tables with the schema (`grid.table(...)`).
+**Maps.** Each map lives in its own schema (`map_<name>`, e.g. `map_indonesia1`). The schema holds `grid_info`, each approach's tables, `plots`, `plot_results` and `evidence_results`. `public.maps` lists the maps. Every query names its tables with the schema (`grid.table(...)`). An upload whose data is already in Neon under another name (same fingerprint) copies those stencils, outlines and evidence pages inside Neon instead of uploading them again, and builds only what is missing.
 
 ## Rules for the whole project
 

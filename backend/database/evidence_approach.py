@@ -142,6 +142,16 @@ def ensure_built(conn, grid: common.Grid) -> None:
             "  python pipeline.py --name NAME --data-dir YOUR_LAYERS --bbox XMIN YMIN XMAX YMAX")
 
 
+def fingerprint_of(path: str, grid: common.Grid) -> str:
+    """evidence.tif's fingerprint, as build stores it in evidence_info (all 32 bits, strip by strip):
+    maps.upload uses it to find evidence pages Neon already holds."""
+    fingerprint = common.Fingerprint(grid)
+    with rasterio.open(path) as src:
+        for row_off in range(0, src.height, PAGE):
+            fingerprint.add(src.read(1, window=Window(0, row_off, src.width, min(PAGE, src.height - row_off))))
+    return fingerprint.hexdigest()
+
+
 _INFO: dict = {}  # (schema, map fingerprint) -> load_info's answer: it never changes for a stored map
 
 

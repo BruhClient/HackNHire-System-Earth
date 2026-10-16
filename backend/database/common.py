@@ -684,11 +684,12 @@ def verify_report(name: str, stats: dict) -> None:
 
 
 def start_build(conn: psycopg.Connection, src, tif_path: str, map_name: str,
-                other_tables: dict[str, str], report=None) -> tuple[Grid, np.ndarray]:
+                other_tables: dict[str, str], report=None, allow_copy: bool = False) -> tuple[Grid, np.ndarray]:
     """Scan the map, choose the colour to leave out, and store the address system in the map's own
     schema (created if needed) and in the list of maps. Refuses a name too close to another map's,
-    and a TIFF that is already stored under another name. If this map held a DIFFERENT TIFF
-    before, the other approach's tables are removed, so a map never mixes two TIFFs."""
+    and a TIFF that is already stored under another name (unless allow_copy: maps.upload is making
+    a copy of that map, reusing what Neon has). If this map held a DIFFERENT TIFF before, the other
+    approach's tables are removed, so a map never mixes two TIFFs."""
     name = map_name.strip()
     schema = map_schema(name)
     grid = Grid.from_dataset(src, name)
@@ -708,8 +709,9 @@ def start_build(conn: psycopg.Connection, src, tif_path: str, map_name: str,
         cur.execute("SELECT name FROM public.maps WHERE fingerprint = %s AND name <> %s",
                     (fingerprint, name))
         same = cur.fetchone()
-        if same:
-            sys.exit(f"This TIFF is already stored as '{same[0]}'.")
+        if same and not allow_copy:
+            sys.exit(f"This TIFF is already stored as '{same[0]}'. Use that map, or upload with "
+                     "python database/maps.py upload, which reuses what Neon already has.")
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
         cur.execute(map_tables_sql(grid))
         cur.execute(f"SELECT fingerprint FROM {grid.table('grid_info')} LIMIT 1")

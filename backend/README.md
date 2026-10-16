@@ -121,6 +121,11 @@ python pipeline.py --name jambi --data-dir D:\eudr\inputs --bbox 103.0 -2.3 103.
 2. **Upload.** The folder goes to Neon as the map `jambi`, with the evidence pages, the stencils
    and the outlines, in one transaction. If anything fails, or you press Ctrl+C, nothing is left
    behind.
+   - **Already in Neon?** If a stored map has the same pixels in the same place (same
+     fingerprint), its stencils, outlines and evidence pages are copied inside Neon instead of
+     being uploaded again; only what it lacks is built and uploaded (e.g. the evidence pages of a
+     map first uploaded from a TIFF). On the Thai test map, a second upload of the same folder took
+     0.7 s instead of 5.2 s (one run each, over Neon). A name that is already taken is still refused.
    - **Protected areas.** Put the WDPA polygons in `--data-dir` as GeoJSON whose file name starts
      with `wdpa` (any case), e.g. `WDPA_Oct2026_Public_IDN-polygons.geojson`. Several files are
      fine. The pipeline finds them by itself and:

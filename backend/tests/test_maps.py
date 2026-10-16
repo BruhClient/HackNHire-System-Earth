@@ -89,5 +89,35 @@ class ListMapsTest(unittest.TestCase):
             self.assertIn(table, maps.MAP_TABLES)
 
 
+
+class ReuseTest(unittest.TestCase):
+    """Data Neon already holds (same fingerprint) is copied inside Neon, not uploaded again."""
+
+    GRID = common.Grid("old", 110.0, -7.0, 1 / 12000, 1 / 12000, 600, 600, 4326, True, fingerprint="abc",
+                       schema="map_old", tables=frozenset({"grid_info", "stencil_pages", "class_polys",
+                                                           "square_labels", "evidence_info", "evidence_pages"}))
+
+    def test_the_stored_map_with_the_most_reusable_parts_is_chosen(self):
+        conn = Script([("WHERE fingerprint", [("old",)]), ("evidence_info", [("ev1",)])])
+        with mock.patch.object(common, "load_grid", return_value=self.GRID):
+            asked = []
+            stored, parts = maps.find_stored(conn, "abc", lambda: asked.append(1) or "ev1")
+            self.assertEqual((stored.map_version, parts), ("old", ["stencils", "outlines", "evidence pages"]))
+            self.assertEqual(asked, [1])                              # evidence.tif read once, only when needed
+            _, parts = maps.find_stored(conn, "abc", lambda: "other evidence", outlines=False)
+            self.assertEqual(parts, ["stencils"])                     # different evidence: built, not copied
+            self.assertEqual(maps.find_stored(Script(), "abc"), (None, []))
+
+    def test_copy_makes_the_new_maps_tables_from_the_stored_ones_inside_neon(self):
+        conn = Script()
+        grid = maps.copy_stored(conn, self.GRID, "New one", "x.tif", ["stencils", "evidence pages"])
+        self.assertEqual((grid.map_version, grid.schema, grid.fingerprint), ("New one", "map_new_one", "abc"))
+        sql = "\n".join(conn.sql)
+        self.assertIn("INSERT INTO map_new_one.stencil_pages SELECT * FROM map_old.stencil_pages", sql)
+        self.assertIn("INSERT INTO map_new_one.evidence_pages SELECT * FROM map_old.evidence_pages", sql)
+        self.assertNotIn("class_polys SELECT", sql)
+        self.assertEqual(conn.commits, 0)                             # maps.upload commits once, at the end
+
+
 if __name__ == "__main__":
     unittest.main()

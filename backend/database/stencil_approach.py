@@ -80,13 +80,13 @@ def ensure_built(conn, grid: common.Grid) -> None:
 # --------------------------------------------------------------------------------------
 # build
 # --------------------------------------------------------------------------------------
-def build(conn, tif: str, map_name: str, report=None, tidy: bool = True) -> common.Grid:
+def build(conn, tif: str, map_name: str, report=None, tidy: bool = True, allow_copy: bool = False) -> common.Grid:
     """Pack the TIFF into the map's stencil_pages. report(label, done, total) follows the progress.
     tidy=False leaves the transaction open and skips VACUUM (maps.upload builds every approach
     in one transaction, then tidies up)."""
     start = time.perf_counter()
     with rasterio.open(tif) as src:
-        grid, _ = common.start_build(conn, src, tif, map_name, OTHER_TABLES, report)
+        grid, _ = common.start_build(conn, src, tif, map_name, OTHER_TABLES, report, allow_copy)
         table = grid.table("stencil_pages")
         with conn.cursor() as cur:
             cur.execute(f"DROP TABLE IF EXISTS {table}")

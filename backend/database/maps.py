@@ -32,9 +32,17 @@ Commands (run from the backend folder; give a path, or a name inside layers/)
     python database/maps.py migrate [--name jambi-v1]                # a map stored the old way
 
 upload is ONE transaction: if anything fails, or you press Ctrl+C, nothing is left behind.
+
+Data already in Neon is not uploaded again. Before writing, upload looks for a stored map with
+the same pixels in the same place (public.maps.fingerprint of the 5 colours; for the evidence,
+evidence_info.fingerprint of evidence.tif). It copies that map's stencils, outlines and evidence
+pages into the new map inside Neon (INSERT ... SELECT: nothing crosses the network), and builds
+and uploads only what is missing (e.g. the evidence pages for a map first uploaded from a TIFF).
+A name already taken is still refused.
 """
 
 import argparse
+import dataclasses
 import os
 import sys
 import time
@@ -113,6 +121,76 @@ def list_maps(conn, with_evidence: bool = False) -> list[dict]:
     return stored
 
 
+# --------------------------------------------------------------------------------------
+# reuse: data Neon already holds is copied inside Neon, not uploaded again
+# --------------------------------------------------------------------------------------
+PARTS = {  # what can be copied: schema.sql's sections (table, then keys) and the tables
+    "stencils": ("stencils", "stencils_keys", ["stencil_pages"]),
+    "outlines": ("outlines", "outlines_keys", ["class_polys", "square_labels"]),
+    "evidence pages": ("evidence", "evidence_keys", ["evidence_info", "evidence_pages"]),
+}
+
+
+def find_stored(conn, colours: str, evidence=None, outlines: bool = True):
+    """The stored map that already holds the most of this data, and which parts of it can be
+    reused: (grid, [parts]), or (None, []). colours: the 5-colour map's fingerprint (a map with the
+    same pixels in the same place has the same one). evidence: a function giving evidence.tif's
+    fingerprint (only called if some map has evidence pages), or None for a TIFF upload."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT name FROM public.maps WHERE fingerprint = %s "
+                    "AND to_regnamespace(schema_name) IS NOT NULL ORDER BY added_at", (colours,))
+        names = [row[0] for row in cur.fetchall()]
+    best, best_parts, wanted = None, [], None
+    for name in names:
+        grid = common.load_grid(conn, name)
+        parts = [part for part, (_, _, tables) in PARTS.items()
+                 if part != "evidence pages" and all(t in grid.tables for t in tables)
+                 and (outlines or part != "outlines")]
+        if evidence is not None and "evidence_info" in grid.tables:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT fingerprint FROM {grid.table('evidence_info')}")
+                row = cur.fetchone()
+            if wanted is None:
+                wanted = evidence()
+            if row and row[0] == wanted and "evidence_pages" in grid.tables:
+                parts.append("evidence pages")
+        if len(parts) > len(best_parts):
+            best, best_parts = grid, parts
+    return best, best_parts
+
+
+def copy_stored(conn, stored: common.Grid, name: str, source_file: str, parts: list[str], report=None) -> common.Grid:
+    """A new map called name, holding a copy of these parts of a stored map with the same pixels:
+    copied inside Neon (INSERT ... SELECT), so nothing is sent over the network again. Leaves the
+    transaction open (maps.upload commits)."""
+    grid = dataclasses.replace(stored, map_version=name, schema=common.map_schema(name), tables=frozenset())
+    with conn.cursor() as cur:
+        cur.execute(common.CATALOGUE_SQL)
+        cur.execute("SELECT name FROM public.maps WHERE schema_name = %s", (grid.schema,))
+        clash = cur.fetchone()
+        if clash:
+            sys.exit(f"'{name}' is too close to the map '{clash[0]}': both would be stored as {grid.schema}. "
+                     "Choose another name.")
+        cur.execute(f"CREATE SCHEMA {grid.schema}")
+        cur.execute(common.map_tables_sql(grid))
+    common.save_grid(conn, grid, source_file)
+    for i, part in enumerate(parts):
+        if report is not None:
+            report(f"copying the {part} inside Neon", i, len(parts))
+        print(f"  copying the {part} from '{stored.map_version}' inside Neon...")
+        make, keys, tables = PARTS[part]
+        with conn.cursor() as cur:
+            if part == "outlines":
+                cur.execute(common.schema_sql("postgis"))
+            cur.execute(common.schema_sql(make, grid))
+            for table in tables:
+                cur.execute(f"INSERT INTO {grid.table(table)} SELECT * FROM {stored.table(table)}")
+            cur.execute(common.schema_sql(keys, grid))
+    if report is not None:
+        report("copying inside Neon", len(parts), len(parts))
+    return grid
+
+
 def upload(conn, source: str, name: str, report=None, outlines: bool = True,
            protected: list[str] | None = None) -> common.Grid:
     """A new map, in one transaction: if anything fails or is cancelled (report may raise),
@@ -143,8 +221,17 @@ def upload(conn, source: str, name: str, report=None, outlines: bool = True,
         problem = size_problem(src.width, src.height)
         if not problem:
             shape_grid = common.Grid.from_dataset(src, name)
+            colours = common.scan_map(src, shape_grid)[1] if has_catalogue else None
     if problem:
         sys.exit(problem)
+    stored, reuse = None, []
+    if colours is not None:   # is this data in Neon already, under another name?
+        evidence = None
+        if results is not None:
+            import evidence_approach
+            import layers
+            evidence = lambda: evidence_approach.fingerprint_of(layers.evidence_file(results), shape_grid)  # noqa: E731
+        stored, reuse = find_stored(conn, colours, evidence, outlines)
     if protected is None:
         protected = protected_areas.find_files(results) if results else []
     areas = protected_areas.read(protected, shape_grid) if protected else []  # read first: fail before writing
@@ -152,10 +239,16 @@ def upload(conn, source: str, name: str, report=None, outlines: bool = True,
         print("  Protected areas: none of them overlaps the map, so none are stored")
     start = time.perf_counter()
     try:
-        grid = stencil_approach.build(conn, tif, name, report, tidy=False)
-        if outlines:
-            grid = polygon_approach.build(conn, tif, name, report, tidy=False)
-        if results is not None:
+        if stored is not None:
+            print(f"Already in Neon as '{stored.map_version}': its {', '.join(reuse)} are copied inside Neon, "
+                  "not uploaded again")
+            grid = copy_stored(conn, stored, name, tif, reuse, report)
+        copy = {"allow_copy": True} if stored is not None else {}   # build what the stored map lacks
+        if "stencils" not in reuse:
+            grid = stencil_approach.build(conn, tif, name, report, tidy=False, **copy)
+        if outlines and "outlines" not in reuse:
+            grid = polygon_approach.build(conn, tif, name, report, tidy=False, **copy)
+        if results is not None and "evidence pages" not in reuse:
             import evidence_approach
             evidence_approach.build(conn, results, name, report, tidy=False)
         if areas:
@@ -181,7 +274,8 @@ def upload(conn, source: str, name: str, report=None, outlines: bool = True,
     tell("tidying up", len(tables), len(tables))
     what = ", ".join(n for n, on in (("stencils", True), ("outlines", outlines), ("evidence pages", results),
                                      ("protected areas", areas)) if on)
-    print(f"Uploaded '{name}' ({what}) in {time.perf_counter() - start:.1f} s")
+    copied = f"; copied inside Neon from '{stored.map_version}': {', '.join(reuse)}" if stored is not None else ""
+    print(f"Uploaded '{name}' ({what}{copied}) in {time.perf_counter() - start:.1f} s")
     common.print_storage(conn, [grid.table(t) for t in MAP_TABLES])
     return grid
 
