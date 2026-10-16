@@ -156,6 +156,24 @@ ALTER TABLE {schema}.evidence_pages ALTER COLUMN evidence SET STORAGE MAIN;
 ALTER TABLE {schema}.evidence_pages ADD PRIMARY KEY (page_row, page_col);
 
 
+-- @protected
+-- Protected areas (protected_areas.py), optional: the polygons of the wdpa*.geojson files that
+-- came with the map (the World Database on Protected Areas), cut to the map's extent. The app
+-- draws them over the map as "protected areas". Needs PostGIS.
+CREATE TABLE {schema}.protected_areas (
+    wdpa_id      TEXT,                    -- WDPAID (or WDPA_PID), if the file has it
+    name         TEXT,                    -- NAME, e.g. 'Berbak'
+    designation  TEXT,                    -- DESIG_ENG, e.g. 'National Park'
+    iucn_cat     TEXT,                    -- IUCN_CAT, e.g. 'II'
+    properties   JSONB NOT NULL,          -- every property of the feature, as the file had it
+    geom         geometry(MultiPolygon, {srid}) NOT NULL   -- in the map's coordinate system
+);
+
+
+-- @protected_keys
+CREATE INDEX protected_areas_geom_idx ON {schema}.protected_areas USING GIST (geom);
+
+
 -- @evidence_results
 -- The evidence check's verdicts, made the first time plots are checked and saved.
 CREATE TABLE IF NOT EXISTS {schema}.evidence_results (

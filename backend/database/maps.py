@@ -3,7 +3,7 @@ maps.py - several maps in one Neon database, each in its own schema (a folder of
 
     public.maps     the list of maps: name, schema, source file, fingerprint, size
     map_<name>      grid_info, stencil_pages, class_polys, square_labels, evidence_info,
-                    evidence_pages, plots, plot_results, evidence_results
+                    evidence_pages, protected_areas, plots, plot_results, evidence_results
 
 A map's schema comes from its name: 'Jambi v1' -> map_jambi_v1 (common.map_schema). Every query
 names its tables with the schema (grid.table(...)), so maps never mix.
@@ -14,6 +14,8 @@ What to upload:
     evidence.tif (every decision fact, with the years and sources)
   * or a TIFF in the 5 colours (0 land, 1 water, 2 forest, 3 deforestation, 4 needs review): the
     stencils and outlines only - this is what the app uploads
+  * with either, protected areas (protected_areas.py): the wdpa*.geojson files in a results folder,
+    or the files given with --protected, cut to the map
 
 Every table is defined in schema.sql. The shared ones are made once (init); a map's own tables are
 made from the same file when it is uploaded.
@@ -23,6 +25,7 @@ Commands (run from the backend folder; give a path, or a name inside layers/)
     python database/maps.py list
     python database/maps.py upload layers/jambi [--name "Jambi v1"]  # a results folder: all three approaches
     python database/maps.py upload my_map.tif [--name "Jambi v1"]    # a 5-colour TIFF: stencils + outlines
+    (add --protected wdpa_IDN.geojson to either to store protected areas with the map)
     (add --no-outlines to either for the lean version: stencils (+ evidence) only, ~24x less storage)
     python database/maps.py rename "Jambi v1" "Jambi 2024"           # its schema follows the name
     python database/maps.py delete "Jambi v1" --yes                  # can't be undone
@@ -41,11 +44,12 @@ import rasterio
 
 import common
 import polygon_approach
+import protected_areas
 import stencil_approach
 
 MAX_PIXELS = 100_000_000   # the app keeps the whole map in memory: 1 byte per pixel
 MAP_TABLES = ["grid_info", "stencil_pages", "class_polys", "square_labels", "evidence_info", "evidence_pages",
-              "plots", "plot_results", "evidence_results"]
+              "protected_areas", "plots", "plot_results", "evidence_results"]
 UPLOAD_STEPS = 7           # a TIFF: stencils: read, pack, index; outlines: read, trace, index; tidy up
 
 
@@ -109,14 +113,16 @@ def list_maps(conn, with_evidence: bool = False) -> list[dict]:
     return stored
 
 
-def upload(conn, source: str, name: str, report=None, outlines: bool = True) -> common.Grid:
+def upload(conn, source: str, name: str, report=None, outlines: bool = True,
+           protected: list[str] | None = None) -> common.Grid:
     """A new map, in one transaction: if anything fails or is cancelled (report may raise),
     everything is rolled back and the database is as it was. Then the new tables are packed
     (VACUUM ANALYZE), which can't run inside a transaction.
     source: a results folder of the compaction step (all three approaches), or a 5-colour TIFF
     (stencils and outlines). outlines=False leaves the outlines out: the stencils (and the
     evidence) answer every check, and the outlines take ~24x the stencils' storage. The app's
-    comparison of the two approaches needs them."""
+    comparison of the two approaches needs them. protected: GeoJSON files of protected areas to
+    store with the map (default: the wdpa*.geojson files in a results folder, none for a TIFF)."""
     name = (name or "").strip()
     common.map_schema(name)  # stops here if the name can't be used
     results, tif = None, source
@@ -135,8 +141,15 @@ def upload(conn, source: str, name: str, report=None, outlines: bool = True) -> 
                          "or delete that map first.")
     with rasterio.open(tif) as src:
         problem = size_problem(src.width, src.height)
+        if not problem:
+            shape_grid = common.Grid.from_dataset(src, name)
     if problem:
         sys.exit(problem)
+    if protected is None:
+        protected = protected_areas.find_files(results) if results else []
+    areas = protected_areas.read(protected, shape_grid) if protected else []  # read first: fail before writing
+    if protected and not areas:
+        print("  Protected areas: none of them overlaps the map, so none are stored")
     start = time.perf_counter()
     try:
         grid = stencil_approach.build(conn, tif, name, report, tidy=False)
@@ -145,6 +158,8 @@ def upload(conn, source: str, name: str, report=None, outlines: bool = True) -> 
         if results is not None:
             import evidence_approach
             evidence_approach.build(conn, results, name, report, tidy=False)
+        if areas:
+            protected_areas.build(conn, grid, areas, report)
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -158,14 +173,14 @@ def upload(conn, source: str, name: str, report=None, outlines: bool = True) -> 
                 pass
 
     built = (["stencil_pages"] + (["class_polys", "square_labels"] if outlines else [])
-             + (["evidence_pages"] if results else []))
+             + (["evidence_pages"] if results else []) + (["protected_areas"] if areas else []))
     tables = [grid.table(t) for t in built]
     for i, table in enumerate(tables):
         tell("tidying up", i, len(tables))
         common.tidy_up(conn, table)
     tell("tidying up", len(tables), len(tables))
-    what = ", ".join(n for n, on in (("stencils", True), ("outlines", outlines), ("evidence pages", results))
-                     if on)
+    what = ", ".join(n for n, on in (("stencils", True), ("outlines", outlines), ("evidence pages", results),
+                                     ("protected areas", areas)) if on)
     print(f"Uploaded '{name}' ({what}) in {time.perf_counter() - start:.1f} s")
     common.print_storage(conn, [grid.table(t) for t in MAP_TABLES])
     return grid
@@ -312,6 +327,9 @@ def main() -> None:
     u.add_argument("--no-outlines", action="store_true",
                    help="leave the outlines out: ~24x less storage; the stencils (and evidence) answer every "
                         "check, but the app can't compare the two approaches on this map")
+    u.add_argument("--protected", action="append", metavar="FILE",
+                   help="a GeoJSON of protected areas to store with the map (repeat for more; default for a "
+                        "results folder: its wdpa*.geojson files)")
     r = sub.add_parser("rename", help="give a map a new name (nothing is copied)")
     r.add_argument("name", help="the map's name now (see: list)")
     r.add_argument("new_name", help="its new name")
@@ -336,7 +354,8 @@ def main() -> None:
             print_list(list_maps(conn, with_evidence=True))
         elif args.cmd == "upload":
             upload(conn, source, args.name or common.default_map_name(os.path.normpath(source)),
-                   outlines=not args.no_outlines)
+                   outlines=not args.no_outlines,
+                   protected=[common.find_geojson(f) for f in args.protected] if args.protected else None)
         elif args.cmd == "rename":
             info = rename(conn, args.name, args.new_name)
             print(f"Renamed '{info['old']}' to '{info['name']}' (schema {info['schema']}).")

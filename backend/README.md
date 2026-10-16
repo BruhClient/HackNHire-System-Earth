@@ -47,6 +47,7 @@ backend/                         <- run every command from here
 │   ├── evidence_approach.py     <- evidence pages: build / check / verify
 │   ├── stencil_approach.py      <- stencils: build / check / verify
 │   ├── polygon_approach.py      <- outlines: build / check / verify
+│   ├── protected_areas.py       <- protected areas (wdpa*.geojson) stored with a map: add / show
 │   ├── common.py                <- shared rules (used by the others, don't run it)
 │   └── results/                 <- verdict CSVs (created automatically)
 ├── compare/
@@ -120,6 +121,18 @@ python pipeline.py --name jambi --data-dir D:\eudr\inputs --bbox 103.0 -2.3 103.
 2. **Upload.** The folder goes to Neon as the map `jambi`, with the evidence pages, the stencils
    and the outlines, in one transaction. If anything fails, or you press Ctrl+C, nothing is left
    behind.
+   - **Protected areas.** Put the WDPA polygons in `--data-dir` as GeoJSON whose file name starts
+     with `wdpa` (any case), e.g. `WDPA_Oct2026_Public_IDN-polygons.geojson`. Several files are
+     fine. The pipeline finds them by itself and:
+     - gives them to `eudr_layers.py` as `--protected`, so the evidence's `protected` fact is set;
+     - saves a copy cut to the map as `layers/jambi/wdpa_protected_areas.geojson`;
+     - stores them with the map in Neon (`protected_areas`, PostGIS), in the same transaction.
+       The app draws them over the map as "Protected areas".
+
+     WDPA points (areas with no boundary) are skipped. To add protected areas to a map already in
+     Neon: `python database/protected_areas.py add "MAP" wdpa_FILE.geojson` (this replaces the
+     map's own protected areas). `maps.py upload` takes `--protected FILE` too, and uploads the
+     `wdpa*.geojson` files of a results folder by itself.
 3. **Check.** The test plots (and `--plots FILE`) are checked against Neon, and the verdicts are
    saved there. Every answer is compared with `eudr_layers.py`'s own answer from `evidence.tif`.
 

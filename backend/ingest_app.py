@@ -44,6 +44,7 @@ from rasterio.warp import transform_bounds  # noqa: E402
 import common  # noqa: E402
 import layers  # noqa: E402
 import maps  # noqa: E402
+import protected_areas  # noqa: E402
 from layers import eudr_layers  # noqa: E402
 
 PIPELINE = os.path.join(BACKEND_DIR, "pipeline.py")
@@ -90,6 +91,8 @@ LAYER_GROUPS = (
          "dynamic_world", "dynamic_world_2021.tif"),
         ("io_lulc", "Impact Observatory land cover", "What the land became after a clearing (Sentinel-2)",
          "io_lulc", "io_lulc_2021.tif"),
+        ("protected", "Protected areas (WDPA, GeoJSON)", "Shown in the app as protected areas; also the "
+         "evidence's 'protected' fact", "wdpa…geojson", "WDPA_Oct2026_Public_IDN-polygons.geojson"),
     )),
 )
 LAYER_LABELS = {row[0]: row[1] for _, _, rows in LAYER_GROUPS for row in rows}
@@ -104,6 +107,8 @@ RULE_NOTES = {  # the fine print of eudr_layers.DISCOVERY, shown as tooltips
               "'rubber' counts too (the 10 m tiles are named only by their corner).",
     "dynamic_world": "The name contains 'dynamic_world' or 'dynamicworld'.",
     "primary_forest": "The name contains 'primary_forest' or 'primary-forest'.",
+    "protected": "A GeoJSON file (.geojson) whose name starts with 'wdpa', e.g. WDPA_Oct2026_Public_IDN-polygons."
+                 "geojson. Several are fine (they are merged). Not a GeoTIFF: the polygons are stored as they are.",
 }
 KEYWORDS = {  # the part of a file name each DISCOVERY rule looks at, to highlight it (any case)
     "gfc2020": r"gfc2020", "lossyear": r"lossyear", "tmf_annual": eudr_layers.ANNUAL_RE.pattern,
@@ -111,7 +116,7 @@ KEYWORDS = {  # the part of a file name each DISCOVERY rule looks at, to highlig
     "tmf_transition": r"transitionmap|main", "gft2020": r"gft2020|subtype", "rubber": r"rubber",
     "datamask": r"datamask", "treecover2000": r"treecover2000", "radd": r"radd",
     "primary_forest": r"primary[_-]forest", "alerts": r"integrated_alerts", "dist_alerts": r"dist_alert",
-    "dynamic_world": r"dynamic_?world", "io_lulc": r"io_lulc",
+    "dynamic_world": r"dynamic_?world", "io_lulc": r"io_lulc", "protected": r"^wdpa|\.geojson$",
 }
 KEY_STYLE = "color:#1d4ed8; font-weight:700;"
 # A results folder (already compressed): (key, file, what it is, required)
@@ -120,11 +125,13 @@ RESULTS_FILES = (
     ("outcome", "outcome.tif", "The outcome map", True),
     ("test_plots", "test_plots.geojson", "Test plots (built with --test-plots)", False),
     ("verified", "summary.json with fidelity", "Built with --verify: the evaluation compares with the layers", False),
+    ("protected", "wdpa*.geojson", "Protected areas, stored with the map (the app shows them)", False),
 )
 TABLE_NOTES = {
     "grid_info": "the map's grid",
     "evidence_info": "evidence.tif's bit layout",
     "evidence_pages": "evidence.tif, in pages",
+    "protected_areas": "the protected areas (PostGIS)",
     "stencil_pages": "the outcome's colours, in pages",
     "class_polys": "the outlines (PostGIS)",
     "square_labels": "squares of one colour",
@@ -255,6 +262,7 @@ def inspect_folder(path: str) -> dict:
         info["verified"] = bool((summary.get("fidelity") or {}).get("plots_compared"))
         info["test_plots"] = os.path.isfile(os.path.join(path, "test_plots.geojson"))
         info["evidence_name"] = os.path.basename(layers.evidence_file(path))
+        info["protected"] = protected_areas.find_files(path)
         return info
     found, annual = eudr_layers.discover(path)
     tifs = [p for p in Path(path).rglob("*") if p.suffix.lower() in (".tif", ".tiff") and p.is_file()]
@@ -266,6 +274,9 @@ def inspect_folder(path: str) -> dict:
                             "layer's keyword (on the right)." if tifs else
                             "No GeoTIFFs here. Choose the folder holding the satellite layers, or a results "
                             "folder (evidence.tif + outcome.tif).")}
+    protected = protected_areas.find_files(path)
+    if protected:
+        found["protected"] = [Path(p) for p in protected]
     info = {"kind": "layers", "found": found, "annual": annual, "unknown": unknown, "n_files": len(tifs),
             "problem": "", "warning": ""}
     has_tmf = bool(annual) or "tmf_deforestation_year" in found
@@ -579,20 +590,24 @@ class ResultsGuide(QWidget):
 
     def show_folder(self, info: dict) -> None:
         have = {"evidence": True, "outcome": True, "test_plots": info.get("test_plots"),
-                "verified": info.get("verified")}
+                "verified": info.get("verified"), "protected": info.get("protected")}
         for key, (icon, title, sub, purpose, required) in self.rows.items():
             if key == "evidence":
                 title.setText(info.get("evidence_name") or "evidence.tif")
             if key == "outcome" and info.get("size"):
                 w, h = info["size"]
                 purpose = f"The outcome map, {w:,} × {h:,} pixels"
+            if key == "protected" and have[key]:
+                files = info["protected"]
+                title.setText(os.path.basename(files[0]) + (f"  + {len(files) - 1} more" if len(files) > 1 else ""))
             if have[key]:
                 tone, text = "ok", purpose
             else:
                 tone = "warn" if key == "verified" else "none"
                 text = {"test_plots": "None: only your own plots (if any) are checked",
                         "verified": "Built without --verify: the evaluation won't have fidelity against the "
-                                    "original layers"}[key]
+                                    "original layers",
+                        "protected": "None: the map is stored without protected areas"}[key]
             set_mark(icon, tone)
             set_prop(sub, "tone", "warn" if tone == "warn" else "")
             sub.setText(text)

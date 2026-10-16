@@ -7,8 +7,12 @@ pipeline.py - the whole chain in one command: satellite layers -> compact layers
      forest 2020, Hansen, JRC TMF, RADD, ...) for the box, and writes the compact layers into
      layers/<name>/: evidence.tif (every decision fact per pixel, 2000-2026, in 32 bits), outcome.tif,
      the test plots and, with --verify, how well both match the original layers.
+     Protected areas: GeoJSON files in --data-dir whose names start with 'wdpa' (e.g.
+     WDPA_Oct2026_Public_IDN-polygons.geojson) are found by themselves and given to eudr_layers.py
+     as --protected; a copy cut to the map is saved as layers/<name>/wdpa_protected_areas.geojson.
   2. Upload (database/maps.py). Stores the folder in Neon as the map <name>, in one transaction:
-     the outcome's 5 colours as stencils and outlines, and evidence.tif as evidence pages.
+     the outcome's 5 colours as stencils and outlines, evidence.tif as evidence pages, and the
+     protected areas (shown in the app as "protected areas").
   3. Check (database/evidence_approach.py). Checks the plots (--plots, and the test plots) against
      Neon, saves the verdicts there, and compares every answer with eudr_layers.py's own answer from
      evidence.tif: the same verdict, reason, hectare figures and years, plot for plot.
@@ -27,6 +31,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 for _folder in ("compaction", "database"):
@@ -37,6 +42,8 @@ import common  # noqa: E402
 import evidence_approach  # noqa: E402
 import layers  # noqa: E402
 import maps  # noqa: E402
+import protected_areas  # noqa: E402
+import rasterio  # noqa: E402
 from layers import eudr_layers  # noqa: E402
 
 
@@ -54,8 +61,22 @@ def parse(argv=None):
     seen = argparse.ArgumentParser(add_help=False)   # options eudr_layers.py also uses in step 3
     seen.add_argument("--plots")
     seen.add_argument("--min-plot-ha", type=float, default=0.0)
-    args.plots, args.min_plot_ha = (lambda a: (a.plots, a.min_plot_ha))(seen.parse_known_args(rest)[0])
+    seen.add_argument("--data-dir")
+    seen.add_argument("--protected")
+    known = seen.parse_known_args(rest)[0]
+    args.plots, args.min_plot_ha, args.data_dir, args.protected =         known.plots, known.min_plot_ha, known.data_dir, known.protected
     return args, rest
+
+
+def save_protected_copy(files: list[str], out: str) -> None:
+    """The protected areas cut to the map, saved in the results folder (wdpa_protected_areas.geojson),
+    so the folder holds everything its upload needs."""
+    with rasterio.open(os.path.join(out, "outcome.tif")) as src:
+        grid = common.Grid.from_dataset(src, "map")
+    areas = protected_areas.read(files, grid)
+    protected_areas.write_geojson(areas, grid, os.path.join(out, protected_areas.FOLDER_COPY))
+    print(f"Protected areas: {len(areas)} overlap the map, saved in "
+          f"{common.nice_path(os.path.join(out, protected_areas.FOLDER_COPY))}")
 
 
 def check_plots(out: str, name: str, plot_files: list[str], min_ha: float) -> bool:
@@ -95,11 +116,25 @@ def main(argv=None) -> int:
             if any(m["name"] == name for m in maps.list_maps(conn)):
                 sys.exit(f"There's already a map called '{name}' in the database. Choose another --name, "
                          f"or delete that map first:\n  python database/maps.py delete \"{name}\" --yes")
+    given = [common.find_geojson(args.protected)] if args.protected else []
     if args.skip_build:
         out = layers.results_folder(out)
     else:
+        found = given or protected_areas.find_files(args.data_dir)
+        if found and not given:
+            print("Protected areas found: " + ", ".join(os.path.basename(f) for f in found))
         print(f"Step 1 of 3: building the compact layers into {common.nice_path(out)} (eudr_layers.py)")
-        eudr_layers.main(rest + ["--out-dir", out])
+        with tempfile.TemporaryDirectory() as tmp:
+            extra = []
+            if found and not given:                    # eudr_layers.py takes one file: merge several
+                one = found[0] if len(found) == 1 else os.path.join(tmp, "wdpa_merged.geojson")
+                if len(found) > 1:
+                    protected_areas.merge(found, one)
+                extra = ["--protected", one]
+            eudr_layers.main(rest + extra + ["--out-dir", out])
+        if found:
+            save_protected_copy(found, out)
+        given = []                                     # the upload takes the copy in the folder
     if args.no_upload:
         print(f"\nDone: the compact layers are in {common.nice_path(out)}. Upload them with:\n"
               f"  python database/maps.py upload \"{common.nice_path(out)}\" --name \"{name}\"")
@@ -107,7 +142,7 @@ def main(argv=None) -> int:
 
     print(f"\nStep 2 of 3: uploading {common.nice_path(out)} to Neon as '{name}'")
     with common.connect() as conn:
-        maps.upload(conn, out, name, outlines=not args.no_outlines)
+        maps.upload(conn, out, name, outlines=not args.no_outlines, protected=given or None)
 
     test_plots = os.path.join(out, "test_plots.geojson")
     plot_files = ([args.plots] if args.plots else []) + ([test_plots] if os.path.isfile(test_plots) else [])

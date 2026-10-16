@@ -76,7 +76,7 @@ Each TIFF pixel holds one value:
 
 ## Layout
 - `pipeline.py`: compaction -> upload -> check the plots against Neon and compare with `evidence.tif`.
-- `ingest_app.py`: the ingest window (PyQt5, in the root `requirements.txt`). It runs `pipeline.py` as a separate process and reads its output (`Step N of 3`, `common.Progress`'s `label: NN.N%` lines, the "Every output the same…" line), so keep those lines' wording when changing them. Its "What the folder must contain" panel (`LAYER_GROUPS`) lists the word each layer's file name must contain, copied from `eudr_layers.DISCOVERY`: change both together. It is the only way maps get into Neon from a window: the frontend no longer uploads.
+- `ingest_app.py`: the ingest window (PyQt5, in the root `requirements.txt`). It runs `pipeline.py` as a separate process and reads its output (`Step N of 3`, `common.Progress`'s `label: NN.N%` lines, the "Every output the same…" line), so keep those lines' wording when changing them. Its "What the folder must contain" panel (`LAYER_GROUPS`) lists the word each layer's file name must contain, copied from `eudr_layers.DISCOVERY`: change both together. The `protected` row is the exception: it is found by `protected_areas.find_files`, not by `DISCOVERY`. It is the only way maps get into Neon from a window: the frontend no longer uploads.
 - `compaction/eudr_layers.py` (Joe's), `compaction/make_test_layers.py` (made-up satellite layers).
 - `database/layers.py`: a results folder as the database sees it (`results_folder`, `class_map`,
   `rule_from`, `check_layout`, `joe_grid`). Imports `eudr_layers` (needs scipy and pandas).
@@ -84,6 +84,11 @@ Each TIFF pixel holds one value:
 - `database/common.py`: shared rules, `Grid`, farm loading, results and the TIFF baseline
   (`check_with_tiff`). Imported by the others, never run.
 - `database/polygon_approach.py`: outlines in PostGIS (`build` / `check` / `verify`).
+- `database/protected_areas.py`: protected areas (WDPA polygons, files named `wdpa*.geojson`), cut to the
+  map and stored in its `protected_areas` table (PostGIS). `maps.upload` stores those in a results folder
+  (or `protected=[files]`); `pipeline.py` finds them in `--data-dir`, passes them to `eudr_layers.py`
+  as `--protected` and saves the cut copy `wdpa_protected_areas.geojson` in the results folder. Display
+  only: no check reads them (the evidence's own `protected` bit comes from Joe's `--protected`).
 - `database/stencil_approach.py`: stencils, 8 × 8 bitmaps packed into 64-bit numbers and zipped
   per 256 × 256 page (same commands).
 - `database/maps.py`: several maps, one schema each (`list` / `upload` both approaches / `rename` / `delete` /
@@ -207,7 +212,8 @@ maps, `frontend\smoke_maps.py` (writes only a throwaway map).
   - It must also work when given only points or only outlines.
 - Both approaches: `ensure_built(conn, grid)`, `build(conn, tif, map_name, report=None, tidy=True)` (returns the `Grid`), `verify(conn, grid, tif)`.
 - `stencil_approach`: `page_size`, `unzip_page` (→ the page's colours, height × width uint8), `pack_page`, `fetch_pages`. The frontend rebuilds the whole map from `SELECT page_col, page_row, colours FROM {grid.table('stencil_pages')}`, and pages with no row are `default_class`.
-- `maps.upload(conn, source, name, report, outlines=True)`; `common.has_tables`, `Grid.tables` (the frontend's `need_outlines` reads it).
+- `maps.upload(conn, source, name, report, outlines=True, protected=None)`; `common.has_tables`, `Grid.tables` (the frontend's `need_outlines` reads it).
+- `protected_areas.load(conn, grid)` → a GeoJSON FeatureCollection in lon/lat (properties `wdpa_id`, `name`, `designation`, `iucn_cat`) or None; one query, none when the map has no `protected_areas`. `protected_areas` must never import pandas, geopandas or `eudr_layers`.
 - `common.TIFF_DIR` (= `LAYERS_DIR`) plus `grid_info.source_file` is where the frontend looks for the reference TIFF.
 - The frontend's environment has no scipy or pandas. So `common`, `maps`, `stencil_approach` and `polygon_approach` must never import `layers`, `evidence_approach` or `eudr_layers` at module level. `maps.upload` imports them only for a results folder.
 
