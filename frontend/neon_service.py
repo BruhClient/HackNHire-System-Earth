@@ -4,8 +4,9 @@ Plain Python (no Qt), so it can be tested on its own and could later sit behind 
 It calls the backend's own functions (see backend.py), so every answer is the one the
 command-line tools give.
 
-It also lists, uploads and deletes the maps stored in Neon (backend/database/maps.py): uploads
-and deletes are the only writes besides saving results.
+It also lists, renames and deletes the maps stored in Neon (backend/database/maps.py): those
+and saving results are the app's only writes. The app doesn't upload maps (they are ingested with
+backend/ingest_app.py); upload_map is kept for smoke_maps.py's throwaway test map only.
 
 Every public method goes through _run(): the transaction is always ended afterwards, so a
 SET LOCAL jit = off never carries over and Neon's pooled connection is not held. If Neon has
@@ -51,8 +52,9 @@ def need_outlines(grid):
     """The app compares stencils with outlines: stop with a clear message on a map without them."""
     if not {"class_polys", "square_labels"} <= grid.tables:
         raise SystemExit(f"The map '{grid.map_version}' was uploaded without outlines (--no-outlines), so the "
-                         "app can't compare the two approaches on it. Upload it again with Maps ▸ Upload map… "
-                         "(which builds both), or check it from the command line: "
+                         "app can't compare the two approaches on it. Ingest it again with the outlines (the "
+                         "ingest window's 'Also store the outlines' box, or pipeline.py without --no-outlines), "
+                         "or check it from the command line: "
                          "python database/stencil_approach.py check FARMS.geojson --map NAME")
 
 
@@ -171,7 +173,8 @@ class NeonService:
 
     def upload_map(self, path, name, keep_copy=True, progress=None, cancel=None):
         """Upload a TIFF as a new map with both approaches, in one transaction: a failure or Cancel
-        leaves Neon as it was. With keep_copy, the TIFF is also copied into backend/data/tiff."""
+        leaves Neon as it was. With keep_copy, the TIFF is also copied into backend/data/tiff.
+        Not reachable from the app's menus: only smoke_maps.py uses it, for its throwaway map."""
         report = UploadProgress(progress or (lambda done, total, text: None), cancel)
         self.on_status(f"Uploading {os.path.basename(path)} to Neon as '{name}'…")
         grid = self._run(lambda conn: maps.upload(conn, path, name, report), write=True, retry=False)

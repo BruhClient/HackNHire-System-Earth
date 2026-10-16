@@ -12,7 +12,7 @@ The app calls the backend's own functions (`backend/database/*.py`), so its answ
 From the project folder (`HackNHire\`):
 
 ```
-frontend\.venv\Scripts\python -m pip install -r frontend/requirements.txt
+frontend\.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
 The app connects with `DATABASE_URL` from the project's `.env`, the same as the backend.

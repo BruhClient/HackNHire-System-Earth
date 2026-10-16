@@ -3,7 +3,7 @@
 This is the desktop app for the EUDR storage prototype (PyQt5, plus one Leaflet map view).
 
 It does three things:
-- reads an EUDR map stored in Neon and shows it colour-coded. Neon can hold several maps, one schema each; the Map dropdown switches between them, and Maps ▾ uploads, renames or deletes them;
+- reads an EUDR map stored in Neon and shows it colour-coded. Neon can hold several maps, one schema each; the Map dropdown switches between them, and Maps ▾ renames or deletes them. The app doesn't upload maps: they are ingested with `backend/ingest_app.py` (or `pipeline.py`);
 - lets the user draw points and polygons (or open GeoJSON), then checks them with both storage approaches;
 - compares the approaches on verdicts, speed and query efficiency, for the two key questions: "is the point in forest?" and "does the outline overlap forest?".
 
@@ -55,8 +55,8 @@ app.py  MainWindow ─┬─ toolbar, tabs [Map | Compare], status bar, event hu
 |---|---|
 | `app.py` | the main window, toolbar, actions, events, job routing, CLI flags, stylesheet |
 | `backend.py` | puts `../backend/database` on `sys.path` and re-exports `common`, `maps`, `polygon_approach`, `stencil_approach` |
-| `neon_service.py` | **the only code that talks to Neon.** Plain Python, no Qt. `list_maps`, `open_map(name)`, `upload_map`, `describe_map`, `rename_map`, `delete_map`, `map_info`, `check`, `_measure`, `saved_farms`, `benchmark`, plus `UploadProgress` and `copy_to_tiff_folder` |
-| `maps_ui.py` | the Map dropdown and Maps ▾ menu (`MapsController`), `UploadDialog`, `RenameDialog`, `DeleteDialog`; which map shows at start-up; each map's drawn farms while the app is open |
+| `neon_service.py` | **the only code that talks to Neon.** Plain Python, no Qt. `list_maps`, `open_map(name)`, `upload_map` (only for `smoke_maps.py`'s throwaway map; no menu reaches it), `describe_map`, `rename_map`, `delete_map`, `map_info`, `check`, `_measure`, `saved_farms`, `benchmark`, plus `UploadProgress` and `copy_to_tiff_folder` |
+| `maps_ui.py` | the Map dropdown and Maps ▾ menu (`MapsController`), `RenameDialog`, `DeleteDialog`; with no maps, points to the ingest window; which map shows at start-up; each map's drawn farms while the app is open |
 | `metering.py` | `MeteredConnection` (logs every query an approach sends: round trips, rows, bytes, time), `summarise`, `explain` (EXPLAIN ANALYZE re-run, always rolled back) |
 | `farms.py` | map or file GeoJSON → backend `Farm`s (unique `plot_id`s, skipped shapes with reasons) |
 | `report.py` | `PlotResult` → JSON rows, the verdict as the worse of the two approaches, agreement, summaries, sentences |
@@ -79,7 +79,7 @@ app.py  MainWindow ─┬─ toolbar, tabs [Map | Compare], status bar, event hu
 Run from the project root (`HackNHire\`) in PowerShell. The venv is `frontend\.venv` (Python 3.13). Keep the code 3.10-compatible.
 
 ```
-frontend\.venv\Scripts\python -m pip install -r frontend/requirements.txt pyflakes   # setup
+frontend\.venv\Scripts\python -m pip install -r requirements.txt pyflakes   # setup (the one requirements.txt, at the root)
 frontend\.venv\Scripts\python frontend\app.py                                     # run the app
 frontend\.venv\Scripts\python -m unittest discover -s frontend/tests -t frontend -v  # all tests
 frontend\.venv\Scripts\python -m unittest discover -s frontend/tests -t frontend -p test_metering.py  # one file
@@ -110,8 +110,7 @@ Show the commands and their output as evidence.
 ## Rules
 
 - **Call the backend; don't copy it.** Call its functions through `backend.py`, so the app gives the same answers as the command-line tools. Change `backend/` only together with its "What the frontend relies on" list in `../backend/CLAUDE.md`.
-- **Read-only by default.** The only writes are:
-  - **Maps ▸ Upload map…** (`maps.upload`);
+- **Read-only by default.** The app never uploads maps (the user chose this: maps are ingested with `backend/ingest_app.py`, which builds the evidence too). The only writes are:
   - **Maps ▸ Rename map…** (`maps.rename`; the schema is renamed with it, nothing is copied. Renaming the map shown keeps it on screen, with its farms and results: `EudrLayer.renamed`);
   - **Maps ▸ Delete map…** (`maps.delete`; the user must type the exact name);
   - **Check ▸ Save results to Neon** (`common.save_results`, off by default).
@@ -161,7 +160,7 @@ Show the commands and their output as evidence.
   - Verdicts: status colours, always with an icon and a label (✖ Not compliant, ⚠ Needs review, ? Cannot check, ⚠ Check the location, ✔ Compliant).
   - Chart text stays in ink colours, never the series colour. A legend is shown for 2 or more series. Every chart has a "Show table" twin.
 - **Wording:** plain English, British spelling (colour, metres). Error messages say how to fix the problem.
-- **Dependencies:** none beyond PyQt5, PyQtWebEngine and `../backend/requirements.txt` (included with `-r`). pyflakes is for lint only.
+- **Dependencies:** none beyond the one `requirements.txt` in the HackNHire folder (shared with the backend). pyflakes is for lint only.
 - **Docs:** when behaviour or numbers change, update `README.md`.
 
 ## Privacy
