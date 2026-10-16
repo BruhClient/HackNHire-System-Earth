@@ -50,6 +50,7 @@ import shapely
 from rasterio.features import rasterize
 
 import common
+import protected_areas
 
 METHOD = "polygons"
 TABLES = ["class_polys", "square_labels"]
@@ -330,6 +331,7 @@ def main() -> None:
             grid = common.load_grid(conn, args.map)
             farms = common.load_farms(args.plots, grid, args.point_mode)
             results, timings = check(conn, grid, farms)
+            protected_areas.apply(results, protected_areas.check(conn, grid, farms))
             common.save_results(conn, grid, farms, results, METHOD)
             common.print_summary(METHOD, results, timings)
             common.write_csv(args.csv, results)

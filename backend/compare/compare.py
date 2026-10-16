@@ -53,6 +53,7 @@ import common  # noqa: E402
 import evidence_approach  # noqa: E402
 import layers  # noqa: E402
 import polygon_approach  # noqa: E402
+import protected_areas  # noqa: E402
 import stencil_approach  # noqa: E402
 from layers import eudr_layers  # noqa: E402
 
@@ -249,6 +250,15 @@ def test_geojson(conn, grid, args, methods, tif_info, show_storage: bool = True)
     print(f"\n=== All {n} farms: decision fidelity (every answer matches the TIFF) ===")
     print(f"    stencils {share(sten, tiff_px, lambda r: r.key()).strip()}    "
           f"polygons {share(poly, tiff_ex, lambda r: r.key()).strip()}")
+    # Protected areas send farms for review (protected_areas.apply). The same step for every method,
+    # after the fidelity figures above, which compare the stored maps only.
+    found = protected_areas.check(conn, grid, farms)
+    for results in (tiff_px, tiff_ex, sten, poly):
+        if results is not None:
+            protected_areas.apply(results, found)
+    if found:
+        print(f"\n{len(found)} farm{'' if len(found) == 1 else 's'} lie in a protected area, so they need review "
+              "(saved verdicts include this).")
     for results, method in ((tiff_px, "tiff-pixel"), (tiff_ex, "tiff-exact"),
                             (sten, stencil_approach.METHOD), (poly, polygon_approach.METHOD)):
         if results is not None:

@@ -19,14 +19,15 @@ from PyQt5.QtWidgets import (QAbstractItemView, QHeaderView, QLabel, QScrollArea
 
 from charts import ChartCard, PairBars, fmt_bytes, fmt_number
 from eudr_layer import colour_icon
-from legend import DEFORESTATION, METHODS, VERDICT_DETAIL, VERDICT_STYLE
+from legend import DEFORESTATION, METHODS, VERDICT_STYLE
+from report import verdict_detail
 
 APPROACHES = ("stencils", "polygons")
 SERIES = [(key, METHODS[key][0], METHODS[key][1]) for key in APPROACHES]
 APPROACH_OF_COLUMN = {2: "stencils", 3: "polygons"}
 QUESTIONS = {"point": "Is the point in forest of 31 Dec 2020?",
              "outline": "Does the outline overlap forest of 31 Dec 2020?"}
-COLUMNS = ["Farm", "Verdict", "Stencils", "Outlines", "2020 forest", "Deforested ha"]
+COLUMNS = ["Farm", "Verdict", "Stencils", "Outlines", "2020 forest", "Deforested ha", "Protected"]
 
 
 def fmt_ms(v):
@@ -110,11 +111,20 @@ def forest_2020_text(row):
     return fmt_table_ha(float(res["forest_2020_ha"])) + " ha"
 
 
+def protected_text(row):
+    """In a protected area? A point: yes; an outline: the hectares inside one; '–' if not."""
+    res = row["results"]["polygons"]
+    if not res.get("protected_areas"):
+        return "–"
+    return "yes" if row["kind"] == "point" else fmt_table_ha(float(res["protected_ha"])) + " ha"
+
+
 def table_cells(row):
     """The texts of one table row (the verdict cell's colour is added by the panel)."""
     def verdict_text(verdict):
         _, icon, headline = VERDICT_STYLE[verdict]
-        why = "" if verdict in ("FAIL", "PASS") else f" · {VERDICT_DETAIL[verdict]}"
+        source = "polygons" if row["results"]["polygons"]["verdict"] == verdict else "stencils"
+        why = "" if verdict in ("FAIL", "PASS") else f" · {verdict_detail(row['results'][source])}"
         return f"{icon} {headline}{why}"
 
     name = row["name"] + (" (point)" if row["kind"] == "point" else "")
@@ -123,7 +133,7 @@ def table_cells(row):
     return [name, verdict_text(row["verdict"]),
             VERDICT_STYLE[row["results"]["stencils"]["verdict"]][1],
             VERDICT_STYLE[row["results"]["polygons"]["verdict"]][1],
-            forest_2020_text(row), ha_text(row, DEFORESTATION)]
+            forest_2020_text(row), ha_text(row, DEFORESTATION), protected_text(row)]
 
 
 class ResultsPanel(QScrollArea):
@@ -209,13 +219,18 @@ class ResultsPanel(QScrollArea):
                     item.setFont(font)
                 if c in (2, 3):  # each approach's verdict as its icon; the words are in the tooltip
                     item.setTextAlignment(Qt.AlignCenter)
-                    verdict = row["results"][APPROACH_OF_COLUMN[c]]["verdict"]
-                    item.setToolTip(f"{VERDICT_STYLE[verdict][2]}: {VERDICT_DETAIL[verdict]}")
+                    res = row["results"][APPROACH_OF_COLUMN[c]]
+                    item.setToolTip(f"{VERDICT_STYLE[res['verdict']][2]}: {verdict_detail(res)}")
                 if c >= 4:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 if c == 4:
                     item.setToolTip("Forest on 31 Dec 2020, the EUDR cut-off date (including forest cleared "
                                     "since): is the point in it, or how much of the outline overlaps it")
+                if c == 6:
+                    names = row["results"]["polygons"].get("protected_areas")
+                    item.setToolTip("In a protected area (WDPA): " + ", ".join(names) + ". A farm in one needs "
+                                    "review: check that farming is allowed there" if names
+                                    else "Not in any protected area stored with this map")
                 if c == 0:
                     item.setToolTip(text)
                 if row.get("stale"):

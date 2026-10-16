@@ -27,6 +27,13 @@ being fetched or the rule being run. Only plots on 2020 forest fetch evidence pa
 are the same as in one step; a screened plot's figures that need the evidence (water, protected
 area, Hansen loss on non-forest land, ...) are left empty (SCREEN_UNKNOWN).
 
+Protected areas: Joe's verdict and reason are kept exactly. The outcome (compliant / non-compliant /
+needs review, saved in evidence_results.facts and the CSV) also counts protected areas:
+deforestation -> non-compliant; deforestation-free but in a protected area -> needs review;
+deforestation-free and in none -> compliant. protected_plots finds those plots with the map's
+stored protected areas (one query) or Joe's own protected fact; it is kept apart from the rows, so
+they still match eudr_layers.py's outputs.
+
 Commands (from the backend folder; a results folder is given by its path or its name in layers/)
     python database/evidence_approach.py build  layers/jambi [--map NAME]
     python database/evidence_approach.py check  layers/jambi/test_plots.geojson [--map NAME]
@@ -56,10 +63,14 @@ from collections import Counter
 import numpy as np
 import rasterio
 from psycopg.types.json import Jsonb
+from pyproj import Transformer
 from rasterio.windows import Window
+from shapely.geometry import Polygon
+from shapely.ops import transform as reproject
 
 import common
 import layers
+import protected_areas
 import stencil_approach
 from layers import eudr_layers
 
@@ -341,8 +352,53 @@ def check(conn, grid: common.Grid, plots, min_ha: float = 0.0, two_step: bool = 
                   "stencil_pages": len(stencil_pages), "screened": sum(1 for f in in_forest if not f)}
 
 
-def save_results(conn, grid: common.Grid, features: list[dict], rows: list[dict]) -> None:
-    """The plots (as sent) and their verdicts, reasons and figures, in the map's own schema."""
+# --------------------------------------------------------------------------------------
+# protected areas: the outcome (not Joe's verdict) of a plot in one
+# --------------------------------------------------------------------------------------
+FROM_EVIDENCE = "a protected area (the evidence's protected fact)"
+
+
+def protected_plots(conn, grid: common.Grid, plots, rows: list[dict]) -> list[tuple]:
+    """For each plot, the protected areas it lies in (sorted names; () if none): the map's stored
+    protected areas (protected_areas.check, one query, as the stencils and outlines use), or else
+    Joe's own protected fact (protected_ha > 0, for a map built with --protected). Kept apart from
+    the rows, which stay exactly eudr_layers.py's outputs."""
+    to_map = None
+    if grid.srid != 4326:   # the plots are in longitude/latitude (read_plots)
+        to_map = Transformer.from_crs(4326, grid.srid, always_xy=True).transform
+    farms = []
+    for pid, geom in zip(plots["plot_id"], plots.geometry):
+        if geom is None or geom.is_empty:
+            geom = Polygon()
+        elif to_map:
+            geom = reproject(to_map, geom)
+        farms.append(common.Farm(str(pid), {}, geom, "outline"))
+    found = protected_areas.check(conn, grid, farms)
+    names = []
+    for i, row in enumerate(rows):
+        ha = row.get("protected_ha")
+        if i in found:
+            names.append(found[i].names)
+        elif isinstance(ha, (int, float)) and ha > 0:
+            names.append((FROM_EVIDENCE,))
+        else:
+            names.append(())
+    return names
+
+
+def outcome(row: dict, protected: tuple = ()) -> str:
+    """A plot's outcome: deforestation -> non-compliant; deforestation-free -> compliant, unless the
+    plot is in a protected area, which needs review (is farming allowed there?); every other verdict
+    of Joe's needs review. His verdict and reason stay as he gives them."""
+    result = common.outcome_of(row["verdict"])
+    return common.NEEDS_REVIEW if result == common.COMPLIANT and protected else result
+
+
+def save_results(conn, grid: common.Grid, features: list[dict], rows: list[dict],
+                 protected: list[tuple] | None = None) -> None:
+    """The plots (as sent) and their verdicts, reasons and figures, in the map's own schema.
+    protected: protected_plots' answer (the outcome then counts protected areas)."""
+    protected = protected or [()] * len(rows)
     results = grid.table("evidence_results")
     with conn.cursor() as cur:
         cur.execute(common.map_tables_sql(grid))
@@ -358,14 +414,16 @@ def save_results(conn, grid: common.Grid, features: list[dict], rows: list[dict]
             "ON CONFLICT (plot_id) DO UPDATE SET verdict = EXCLUDED.verdict, reason = EXCLUDED.reason, "
             "facts = EXCLUDED.facts, checked_at = now()",
             [(r["plot_id"], r["verdict"], r["reason"],
-              Jsonb({"outcome": common.outcome_of(r["verdict"]),
-                     **{k: v for k, v in r.items() if k not in ("plot_id", "verdict", "reason")}})) for r in rows])
+              Jsonb({"outcome": outcome(r, p), "protected_areas": list(p),
+                     **{k: v for k, v in r.items() if k not in ("plot_id", "verdict", "reason")}}))
+             for r, p in zip(rows, protected)])
     conn.commit()
 
 
-def write_csv(path: str, rows: list[dict]) -> None:
+def write_csv(path: str, rows: list[dict], protected: list[tuple] | None = None) -> None:
     common.make_parent(path)
-    rows = [{**r, "outcome": common.outcome_of(r["verdict"])} for r in rows]
+    protected = protected or [()] * len(rows)
+    rows = [{**r, "outcome": outcome(r, p), "protected_areas": "; ".join(p)} for r, p in zip(rows, protected)]
     columns = FIRST_COLUMNS + [c for c in rows[0] if c not in FIRST_COLUMNS] if rows else FIRST_COLUMNS
     with open(path, "w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.DictWriter(fh, columns)
@@ -374,7 +432,7 @@ def write_csv(path: str, rows: list[dict]) -> None:
     print(f"Wrote {common.nice_path(path)}")
 
 
-def print_summary(rows: list[dict], timings: dict) -> None:
+def print_summary(rows: list[dict], timings: dict, protected: list[tuple] | None = None) -> None:
     n = len(rows)
     total = timings["total_s"]
     print(f"\n{METHOD}: checked {n} plots in {total:.3f} s ({1000 * total / max(n, 1):.2f} ms per plot), "
@@ -383,9 +441,13 @@ def print_summary(rows: list[dict], timings: dict) -> None:
         print(f"  Two steps: {n - timings['screened']} plots touch forest of 31 Dec 2020 and were judged on "
               f"their evidence; {timings['screened']} touch none, so they were settled from the stencils alone "
               f"({timings['stencil_pages']} stencil pages fetched)")
-    outcomes = Counter(common.outcome_of(r["verdict"]) for r in rows)
-    for outcome in common.OUTCOMES:
-        print(f"  {outcome:24s} {outcomes.get(outcome, 0)}")
+    protected = protected or [()] * len(rows)
+    outcomes = Counter(outcome(r, p) for r, p in zip(rows, protected))
+    for name in common.OUTCOMES:
+        print(f"  {name:24s} {outcomes.get(name, 0)}")
+    moved = sum(1 for r, p in zip(rows, protected) if p and common.outcome_of(r["verdict"]) == common.COMPLIANT)
+    if moved:
+        print(f"  ({moved} deforestation-free plot{'' if moved == 1 else 's'} in a protected area, so needing review)")
     print("  why: " + ", ".join(f"{v} {c}" for v, c in Counter(r["verdict"] for r in rows).most_common()))
 
 
@@ -448,9 +510,10 @@ def main() -> None:
             grid = common.load_grid(conn, args.map)
             plots, features = read_plots(args.plots)
             rows, timings = check(conn, grid, plots, args.min_plot_ha, two_step=args.two_step)
-            save_results(conn, grid, features, rows)
-            print_summary(rows, timings)
-            write_csv(args.csv, rows)
+            protected = protected_plots(conn, grid, plots, rows)
+            save_results(conn, grid, features, rows, protected)
+            print_summary(rows, timings, protected)
+            write_csv(args.csv, rows, protected)
         else:
             stats = verify(conn, common.load_grid(conn, args.map), args.results)
             print(f"Evidence: rebuilt {stats['pixels']:,} pixels from the database - {stats['mismatched']:,} "

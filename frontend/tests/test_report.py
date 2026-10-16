@@ -61,6 +61,26 @@ class CardTest(unittest.TestCase):
         self.assertEqual((card["verdict"], card["source"]), ("FAIL", "stencils"))
         self.assertEqual(card["sentence"], "Deforestation after 31 Dec 2020 on <0.01 ha (0.1% of the farm).")
 
+    def test_a_farm_in_a_protected_area_needs_review_and_says_why(self):
+        from backend import protected_areas
+        r = exact({LAND: 10000})
+        protected_areas.apply([r], {0: protected_areas.Overlap(("Berbak",), 2500.0)})
+        card = self.card(r, r)
+        self.assertEqual((card["verdict"], card["outcome"]), ("MANUAL_REVIEW", "NEEDS_REVIEW"))
+        self.assertEqual(card["detail"], report.PROTECTED_DETAIL)
+        self.assertEqual(card["sentence"],
+                         "The farm doesn't overlap forest of 31 Dec 2020, so it can't be deforestation. 0.25 ha of "
+                         "the farm is in a protected area (Berbak), so a person has to check that farming is "
+                         "allowed there.")
+        row = row_for(r, r)
+        import results_panel
+        self.assertEqual(results_panel.table_cells(row)[6], "0.25 ha")
+        self.assertIn(report.PROTECTED_DETAIL, results_panel.table_cells(row)[1])
+        p = common.point_result(point_farm(), LAND)
+        protected_areas.apply([p], {0: protected_areas.Overlap(("Berbak",), 0.0)})
+        self.assertEqual(results_panel.table_cells(row_for(p, p, kind="point"))[6], "yes")
+        self.assertEqual(results_panel.table_cells(row_for(exact({LAND: 10000}), exact({LAND: 10000})))[6], "–")
+
     def test_needs_review(self):
         r = exact({LAND: 7500, REVIEW: 2500})
         self.assertEqual(self.card(r, r)["sentence"],

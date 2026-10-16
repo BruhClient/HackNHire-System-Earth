@@ -24,6 +24,8 @@ Claude Code loads the `CLAUDE.md` of the folder you work in. The rules in each o
 
 Stencils and outlines store the outcome in 5 colours. They give the same verdict on every test farm so far: 1,111 of 1,111 in the app's benchmark. The evidence pages give the same 35 outputs as `evidence.tif` on every plot tested, and Joe's `--verify` shows `evidence.tif` matches the original layers.
 
+**Protected areas.** GeoJSON files named `wdpa*.geojson` (WDPA polygons) given at ingest are stored with the map (`protected_areas`, `backend/database/protected_areas.py`), and the app draws them as "Protected areas". A farm in one needs review: `protected_areas.check`/`apply` turn any lesser verdict into `MANUAL_REVIEW` (deforestation stays `FAIL`), the same for stencils, outlines and the TIFF baseline. Evidence-page checks keep Joe's verdict and reason, but their outcome turns a deforestation-free plot in a protected area into needs review.
+
 **Maps.** Each map lives in its own schema (`map_<name>`, e.g. `map_indonesia1`). The schema holds `grid_info`, each approach's tables, `plots`, `plot_results` and `evidence_results`. `public.maps` lists the maps. Every query names its tables with the schema (`grid.table(...)`).
 
 ## Rules for the whole project

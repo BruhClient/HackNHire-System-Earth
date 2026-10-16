@@ -66,7 +66,7 @@ app.py  MainWindow ─┬─ toolbar, tabs [Map | Compare], status bar, event hu
 | `pages.py`, `map_area.py` | the map page loader, the bridge, and Qt widgets floating over the map |
 | `eudr_layer.py`, `web/map_eudr.js` | the colour-coded layer, legend, opacity, Layers menu, loading/error banner with Retry; the map's protected areas (`open_map` reads them into `service.protected`; dashed outlines in the `protected` pane, with a legend row and a Layers toggle) |
 | `checks_ui.py` | Point tool, Open ▾, Check ▾ and its options, stale and deleted detection, `open_path` |
-| `results_panel.py` | results table, and per-question "Stencils vs outlines · last check" comparison |
+| `results_panel.py` | results table (with a Protected column), and per-question "Stencils vs outlines · last check" comparison. `neon_service.check` runs the backend's `protected_areas.check` once and applies it to every method, so a farm in a protected area needs review |
 | `compare_tab.py`, `farmgen.py` | the benchmark tab, and seeded made-up farms (points, plus 0.5–20 ha polygons) |
 | `charts.py` | QPainter charts: `ChartCard` (title, legend, "Show table" twin), `PairBars` (small multiples), `LineChart` (log-log with crosshair) |
 | `web/map.html`, `web/map.js` | the Leaflet map: drawing, editing, points, verdict styling, `addFeatures`, `setVerdicts`, `selectShape`, `zoomToShape` |

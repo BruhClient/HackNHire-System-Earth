@@ -286,6 +286,7 @@ class NeonService:
         seconds = {"stencils": 0.0, "polygons": 0.0}
         runs = {m: {} for m in ("stencils", "polygons")}
         batches = {q: [i for i, f in enumerate(farms) if f.kind == q] for q in self.QUESTIONS}
+        found = {}  # farm index -> protected_areas.Overlap
 
         def run(conn):
             for method in ("stencils", "polygons"):
@@ -299,6 +300,12 @@ class NeonService:
                         results[method][i] = answer
                     seconds[method] += stats["seconds"]
                     runs[method][question] = stats
+            # Protected areas send farms for review: one query, the same answer for both approaches
+            # (and the TIFF below), so it is not part of either approach's numbers.
+            found.update(protected_areas.check(conn, grid, farms))
+            conn.rollback()
+            for method in ("stencils", "polygons"):
+                protected_areas.apply(results[method], found)
             if save:
                 for method in ("stencils", "polygons"):
                     common.save_results(conn, grid, farms, results[method], method)
@@ -311,6 +318,7 @@ class NeonService:
                 for method, mode in (("tiff_pixel", "pixel"), ("tiff_exact", "exact")):
                     answers, timings = common.check_with_tiff(self.tif_path, grid, farms, mode, all_touched)
                     results[method], seconds[method] = answers, timings["total_s"]
+                    protected_areas.apply(answers, found)
         rows = [farm_row(key, farm.plot_id, farm.kind, farm_area_ha(farm, grid),
                          {method: answers[i] for method, answers in results.items()})
                 for i, (key, farm) in enumerate(zip(keys, farms))]
